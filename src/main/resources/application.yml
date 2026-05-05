@@ -1,0 +1,82 @@
+server:
+  port: 8080
+
+spring:
+  profiles:
+    active: dev
+  application:
+    name: chatroom-backend
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+
+# JWT 配置
+jwt:
+  secret: ${JWT_SECRET:change-me-in-production-must-be-256-bit}
+  access-token-expire: 1800      # 30分钟（秒）
+  refresh-token-expire: 604800   # 7天（秒）
+
+# 业务配置
+chat:
+  offline-msg:
+    max-per-user: 500
+    page-size: 50
+  message:
+    revoke-timeout: 120          # 撤回超时（秒）
+  websocket:
+    heartbeat-timeout: 60        # 心跳超时（秒）
+  group:
+    write-fanout-threshold: 1000 # 写扩散阈值：成员数 < 此值用写扩散，否则读扩散
+    max-member-count: 2000       # 群聊人数上限，建群和拉人时校验
+  session-list:
+    page-size: 20                # 会话列表每页条数
+
+# 线程池配置
+thread-pool:
+  msg-persist:
+    core-size: 10
+    max-size: 50
+    queue-capacity: 1000
+  cache-rebuild:
+    core-size: 2
+    max-size: 10
+    queue-capacity: 200
+
+# XXL-Job 配置
+xxl:
+  job:
+    admin:
+      addresses: http://127.0.0.1:8080/xxl-job-admin
+    executor:
+      appname: chatroom-executor
+      address:
+      ip:
+      port: 9999
+      logpath: /data/applogs/xxl-job
+      logretentiondays: 30
+    accessToken: ${XXL_JOB_ACCESS_TOKEN:default-token}
+
+# Redisson 看门狗
+redisson:
+  lock-watchdog-timeout: 30000
+
+# 分片上传配置
+upload:
+  # 临时分片存储目录（绝对路径，生产环境建议挂载独立磁盘）
+  tmp-dir: /tmp/chatroom-upload
+  # 单个文件最大字节数（默认 10MB，头像场景够用）
+  max-file-size: 10485760
+  # 单个分片最大字节数（默认 2MB）
+  max-chunk-size: 2097152
+  # 上传任务过期时间（秒，默认 24h）
+  task-expire: 86400
+  # 允许上传的 MIME 类型白名单（逗号分隔）
+  allowed-types: image/jpeg,image/png,image/gif,image/webp
+  # OSS 配置（占位，接入真实 OSS 时填写）
+  oss:
+    endpoint: ${OSS_ENDPOINT:http://localhost:9000}
+    bucket: ${OSS_BUCKET:chatroom}
+    access-key: ${OSS_ACCESS_KEY:minioadmin}
+    secret-key: ${OSS_SECRET_KEY:minioadmin}
+    # 返回给前端的 URL 前缀（CDN 域名或 OSS 公网地址）
+    url-prefix: ${OSS_URL_PREFIX:http://localhost:9000/chatroom}

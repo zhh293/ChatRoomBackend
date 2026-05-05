@@ -1,0 +1,83 @@
+# 生产环境配置（敏感信息通过环境变量注入）
+spring:
+  shardingsphere:
+    datasource:
+      names: ds0
+      ds0:
+        type: com.zaxxer.hikari.HikariDataSource
+        driver-class-name: com.mysql.cj.jdbc.Driver
+        jdbc-url: ${DB_URL}
+        username: ${DB_USERNAME}
+        password: ${DB_PASSWORD}
+    rules:
+      sharding:
+        tables:
+          chat_message:
+            actual-data-nodes: ds0.chat_message_$->{0..15}
+            table-strategy:
+              standard:
+                sharding-column: session_id
+                sharding-algorithm-name: chat-message-mod
+        sharding-algorithms:
+          chat-message-mod:
+            type: MOD
+            props:
+              sharding-count: 16
+    props:
+      sql-show: false
+
+  data:
+    redis:
+      # 生产环境使用主从集群，通过 Lettuce 读写分离
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD}
+      lettuce:
+        read-from: REPLICA_PREFERRED   # 读优先走从库
+
+  # ============================================================
+  # 【Redis Cluster 预留 - 生产环境】启用时：
+  #   1. 注释掉上方 host/port 主从配置
+  #   2. 取消下方注释
+  #   3. 同步取消 pom.xml commons-pool2、RedisClusterConfig.java 的注释
+  #   4. 通过环境变量 REDIS_CLUSTER_NODES 注入节点列表，格式：
+  #      host1:port1,host2:port2,...（逗号分隔，Spring 自动解析为 List）
+  # ============================================================
+  # data:
+  #   redis:
+  #     password: ${REDIS_PASSWORD}
+  #     cluster:
+  #       nodes: ${REDIS_CLUSTER_NODES}    # 环境变量注入，格式: host1:port1,host2:port2,...
+  #       max-redirects: 3                 # 最大重定向次数（MOVED/ASK）
+  #     lettuce:
+  #       pool:
+  #         max-active: 50
+  #         max-idle: 20
+  #         min-idle: 10
+  #         max-wait: 1000ms
+  #       cluster:
+  #         refresh:
+  #           adaptive: true               # 自适应拓扑刷新：节点故障/扩缩容时自动感知
+  #           period: 30s                  # 定期刷新间隔
+  # ============================================================
+  # 【Redis Cluster 预留 END】
+  # ============================================================
+
+  rabbitmq:
+    host: ${RABBITMQ_HOST}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME}
+    password: ${RABBITMQ_PASSWORD}
+    publisher-confirm-type: correlated
+    publisher-returns: true
+    listener:
+      simple:
+        acknowledge-mode: manual
+        concurrency: 10
+        max-concurrency: 50
+        prefetch: 10
+
+mybatis-plus:
+  mapper-locations: classpath*:mapper/**/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
