@@ -309,12 +309,11 @@ public class MessageServiceImpl implements MessageService {
         update.setStatus(2);
         chatMessageMapper.updateById(update);
 
-        // 同步更新 ZSet 缓存中的消息（删除旧条目，写入撤回状态的新条目）
-        // 简化处理：直接从 ZSet 删除，前端查询时会看到 DB 中 status=2 的记录
-        messageCacheService.removeMessage(msg.getSessionId(), msgId);
-
-        // 从历史消息 ZSet 中精确删除这一条，避免用户翻历史时看到已撤回的消息
-        messageCacheService.evictHistoryMessage(msg.getSessionId(), msgId);
+        // Pipeline 合并删除热消息 ZSet + 历史消息 ZSet，一次网络往返
+        // 前端查询时会看到 DB 中 status=2 的撤回记录
+        Session session = sessionCacheService.getSessionById(msg.getSessionId());
+        Integer memberCount = session != null ? session.getMemberCount() : null;
+        messageCacheService.revokeMessageCache(msg.getSessionId(), msgId, memberCount);
     }
 
     // =========================================================================

@@ -19,6 +19,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -365,20 +366,37 @@ public class MessageCacheService {
     }
 
     /**
-     * 从历史消息 ZSet 中删除单条消息（撤回时调用）
+     * 撤回消息：Pipeline 合并删除热消息 ZSet + 历史消息 ZSet，一次网络往返
      *
-     * <p>精确删除 score = msgId 的那一条，不影响其他消息。
+     * <p>热消息 ZSet 可能有多个 key（大群分片），历史消息 ZSet 固定一个 key，
+     * 全部打包进同一个 Pipeline 批量执行，减少 RTT。
      *
-     * @param sessionId 会话 ID
-     * @param msgId     被撤回的消息 ID
+     * @param sessionId   会话 ID
+     * @param msgId       被撤回的消息 ID
+     * @param memberCount 群人数（用于路由热消息 ZSet 分片），null 时保守删全部
      */
-    public void evictHistoryMessage(Long sessionId, Long msgId) {
-        String key = RedisKeyConst.MSG_HISTORY + sessionId;
+    public void revokeMessageCache(Long sessionId, Long msgId, Integer memberCount) {
+        List<String> hotKeys = resolveWriteKeys(sessionId, memberCount);
+        String historyKey = RedisKeyConst.MSG_HISTORY + sessionId;
+        double score = (double) msgId;
+
         try {
-            stringRedisTemplate.opsForZSet().removeRangeByScore(key, msgId, msgId);
-            log.debug("[MessageCache] 删除历史缓存单条消息, sessionId={}, msgId={}", sessionId, msgId);
+            stringRedisTemplate.executePipelined((org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
+                // 删热消息 ZSet（小群 1 个 key，大群 4 个分片 key）
+                for (String key : hotKeys) {
+                    connection.zSetCommands().zRemRangeByScore(
+                            key.getBytes(),
+                            org.springframework.data.domain.Range.closed(score, score));
+                }
+                // 删历史消息 ZSet
+                connection.zSetCommands().zRemRangeByScore(
+                        historyKey.getBytes(),
+                        org.springframework.data.domain.Range.closed(score, score));
+                return null;
+            });
+            log.debug("[MessageCache] Pipeline 撤回缓存, sessionId={}, msgId={}", sessionId, msgId);
         } catch (Exception e) {
-            log.warn("[MessageCache] 删除历史缓存消息失败, sessionId={}, msgId={}", sessionId, msgId, e);
+            log.warn("[MessageCache] Pipeline 撤回缓存失败, sessionId={}, msgId={}", sessionId, msgId, e);
         }
     }
 
