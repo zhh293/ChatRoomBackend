@@ -25,6 +25,17 @@ chat:
     revoke-timeout: 120          # 撤回超时（秒）
   websocket:
     heartbeat-timeout: 60        # 心跳超时（秒）
+
+# Netty WebSocket 配置（独立端口，与 Spring HTTP 8080 分开）
+netty:
+  websocket:
+    port: 9090                   # Netty 监听端口
+    boss-threads: 1              # Boss 线程数（接受连接）
+    worker-threads: 0            # Worker 线程数，0 = CPU*2
+    path: /ws/chat               # WebSocket 升级路径
+    max-frame-size: 65536        # 单帧最大字节数（64KB）
+    reader-idle-seconds: 30      # 读空闲超时，触发后发 PING
+    all-idle-seconds: 60         # 全空闲超时，触发后关闭连接
   group:
     write-fanout-threshold: 1000 # 写扩散阈值：成员数 < 此值用写扩散，否则读扩散
     max-member-count: 2000       # 群聊人数上限，建群和拉人时校验
