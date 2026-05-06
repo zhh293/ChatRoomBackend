@@ -27,6 +27,7 @@ chat:
     heartbeat-timeout: 60        # 心跳超时（秒）
   group:
     write-fanout-threshold: 1000 # 写扩散阈值：成员数 < 此值用写扩散，否则读扩散
+    max-member-count: 2000       # 群聊人数上限，建群和拉人时校验
   session-list:
     page-size: 20                # 会话列表每页条数
 

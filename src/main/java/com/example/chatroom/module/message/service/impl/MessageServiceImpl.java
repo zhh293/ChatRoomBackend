@@ -188,62 +188,94 @@ public class MessageServiceImpl implements MessageService {
         Session session = sessionCacheService.getSessionById(sessionId);
         Integer memberCount = session != null ? session.getMemberCount() : null;
 
-        List<ChatMessageMQDTO> cached;
-        boolean hitCache;
-
-        if ("before".equals(direction)) {
-            // before：加载比 cursor 更早的消息（cursor=null 表示首次加载，取最新）
-            cached = messageCacheService.getMessagesBefore(sessionId, userId, memberCount, cursor, safeSize);
-            if (cached == null) {
-                // ZSet 不存在，直接回源 DB
-                hitCache = false;
-                cached = Collections.emptyList();
-            } else {
-                // ZSet 存在，但需要判断缓存是否覆盖了请求范围
-                // 若 cursor 比 ZSet 最小 msgId 还小，说明请求的是更老的数据，需回源 DB
-                Long minMsgId = messageCacheService.getMinMsgId(sessionId, userId, memberCount);
-                hitCache = cursor == null || minMsgId == null || cursor > minMsgId || !cached.isEmpty();
-            }
-        } else {
-            // after：加载比 cursor 更新的消息
-            cached = messageCacheService.getMessagesAfter(sessionId, userId, memberCount, cursor, safeSize);
-            hitCache = cached != null;
-            if (!hitCache) cached = Collections.emptyList();
-        }
-
         List<MessageVO> voList;
         boolean hasMore;
         Long nextCursor;
 
-        if (hitCache && !cached.isEmpty()) {
-            // 缓存命中
-            voList = cached.stream().map(this::toVO).collect(Collectors.toList());
-            // before 方向：返回的是倒序，需要正序给前端
-            if ("before".equals(direction)) {
-                Collections.reverse(voList);
-            }
-            nextCursor = "before".equals(direction)
-                    ? voList.get(0).getMsgId()          // 最早那条的 msgId 作为下一页游标
-                    : voList.get(voList.size() - 1).getMsgId();
-            hasMore = cached.size() == safeSize;
-        } else {
-            // 缓存 miss，回源 DB
-            List<ChatMessage> dbList;
-            if ("before".equals(direction)) {
-                dbList = cursor == null
-                        ? chatMessageMapper.selectLatest(sessionId, safeSize)
-                        : chatMessageMapper.selectBefore(sessionId, cursor, safeSize);
+        if ("after".equals(direction)) {
+            // ---------------------------------------------------------------
+            // after 方向：追新消息，ZSet 热缓存通常必然命中，miss 直接回源 DB 兜底
+            // 不做补查合并，after 场景极少走到 DB
+            // ---------------------------------------------------------------
+            List<ChatMessageMQDTO> cached = messageCacheService.getMessagesAfter(
+                    sessionId, userId, memberCount, cursor, safeSize);
+            if (cached != null && !cached.isEmpty()) {
+                voList = cached.stream().map(this::toVO).collect(Collectors.toList());
+                hasMore = cached.size() == safeSize;
+                nextCursor = voList.get(voList.size() - 1).getMsgId();
             } else {
-                // after 方向：DB 没有专门的 after 查询，用 before 的反向逻辑
-                // 实际业务中 after 主要用于实时追新，缓存通常命中，这里做兜底
-                dbList = cursor == null
+                List<ChatMessage> dbList = cursor == null
                         ? chatMessageMapper.selectLatest(sessionId, safeSize)
                         : chatMessageMapper.selectBefore(sessionId, cursor, safeSize);
+                voList = dbList.stream().map(this::toVO).collect(Collectors.toList());
+                Collections.reverse(voList);
+                hasMore = dbList.size() == safeSize;
+                nextCursor = voList.isEmpty() ? null : voList.get(voList.size() - 1).getMsgId();
             }
-            voList = dbList.stream().map(this::toVO).collect(Collectors.toList());
-            // selectLatest/selectBefore 返回的是 DESC，需要正序
+        } else {
+            // ---------------------------------------------------------------
+            // before 方向：三层补查合并
+            //
+            // 所有层返回的数据均为 DESC 顺序（最新在前，最老在后），
+            // 每层不足时用当前层最老那条的 msgId 作为下一层的 cursor 继续补查，
+            // 最终合并成一个 DESC 列表，reverse 后正序返回给前端。
+            //
+            // 层级：① 热消息 ZSet（msg:buf）→ ② 历史消息 ZSet（msg:history）→ ③ DB
+            // ---------------------------------------------------------------
+
+            // 结果列表（DESC 顺序，最终 reverse）
+            List<Object> result = new java.util.ArrayList<>(safeSize);
+            int remaining = safeSize;
+            // 当前补查游标，随每层推进
+            Long curCursor = cursor;
+
+            // ① 热消息 ZSet
+            if (remaining > 0) {
+                List<ChatMessageMQDTO> hotPart = messageCacheService.getMessagesBefore(
+                        sessionId, userId, memberCount, curCursor, remaining);
+                if (hotPart != null && !hotPart.isEmpty()) {
+                    result.addAll(hotPart);
+                    remaining -= hotPart.size();
+                    // 热缓存最老那条作为下一层 cursor
+                    curCursor = hotPart.get(hotPart.size() - 1).getMsgId();
+                }
+            }
+
+            // ② 历史消息 ZSet（热缓存不足才进来）
+            if (remaining > 0) {
+                List<ChatMessage> historyPart = messageCacheService.getHistoryMessages(
+                        sessionId, curCursor, remaining);
+                if (historyPart != null && !historyPart.isEmpty()) {
+                    result.addAll(historyPart);
+                    remaining -= historyPart.size();
+                    // 历史缓存最老那条作为下一层 cursor
+                    curCursor = historyPart.get(historyPart.size() - 1).getId();
+                }
+            }
+
+            // ③ DB 补查（前两层都不足才进来）
+            if (remaining > 0) {
+                List<ChatMessage> dbPart = curCursor == null
+                        ? chatMessageMapper.selectLatest(sessionId, remaining)
+                        : chatMessageMapper.selectBefore(sessionId, curCursor, remaining);
+                if (!dbPart.isEmpty()) {
+                    // DB 查出来的写进历史 ZSet，下次翻这段直接命中
+                    messageCacheService.putHistoryMessages(sessionId, dbPart);
+                    result.addAll(dbPart);
+                    remaining -= dbPart.size();
+                }
+            }
+
+            // 统一转 VO，result 中混有 ChatMessageMQDTO（热缓存）和 ChatMessage（历史/DB）
+            voList = result.stream()
+                    .map(o -> o instanceof ChatMessageMQDTO
+                            ? toVO((ChatMessageMQDTO) o)
+                            : toVO((ChatMessage) o))
+                    .collect(Collectors.toList());
+
+            // result 是 DESC，reverse 成正序给前端
             Collections.reverse(voList);
-            hasMore = dbList.size() == safeSize;
+            hasMore = remaining == 0; // remaining=0 说明凑满了 safeSize 条，可能还有更多
             nextCursor = voList.isEmpty() ? null : voList.get(0).getMsgId();
         }
 
@@ -280,6 +312,9 @@ public class MessageServiceImpl implements MessageService {
         // 同步更新 ZSet 缓存中的消息（删除旧条目，写入撤回状态的新条目）
         // 简化处理：直接从 ZSet 删除，前端查询时会看到 DB 中 status=2 的记录
         messageCacheService.removeMessage(msg.getSessionId(), msgId);
+
+        // 从历史消息 ZSet 中精确删除这一条，避免用户翻历史时看到已撤回的消息
+        messageCacheService.evictHistoryMessage(msg.getSessionId(), msgId);
     }
 
     // =========================================================================

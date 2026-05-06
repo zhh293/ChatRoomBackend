@@ -79,6 +79,31 @@ public interface RedisKeyConst {
     String WS_SYNC_CHANNEL = "ws:sync";
     String WS_PUSH_CHANNEL_PREFIX = "ws:push:";
 
+    /**
+     * 历史消息翻阅缓存（ZSet，与热消息缓冲区结构一致）
+     *
+     * <pre>
+     * key   = msg:history:{sessionId}
+     * score = msgId（雪花ID，天然有序）
+     * value = 消息内容 JSON（ChatMessage）
+     * TTL   = MSG_HISTORY_TTL（10分钟，冷数据用完即过期）
+     *
+     * 适用场景：用户向上翻阅超出热消息 ZSet（msg:buf）范围的历史消息。
+     * session 级公共缓存，所有用户共享同一个 ZSet，
+     * 任意 cursor 范围均可用 ZRANGEBYSCORE 精确命中，
+     * 避免多用户翻同一段历史时重复打 DB。
+     *
+     * 与 msg:buf 的区别：
+     *   - TTL 短（10min vs 7d），历史冷数据不长期占内存
+     *   - 无条数上限裁剪，翻多深缓多深，靠 TTL 控制生命周期
+     *   - 不按 userId 分片，历史消息无写扩散压力
+     * </pre>
+     */
+    String MSG_HISTORY = "msg:history:";
+
+    /** 历史消息翻阅缓存 TTL（秒，10分钟） */
+    int MSG_HISTORY_TTL = 600;
+
     // ===== 消息幂等 =====
     String MSG_IDEM = "msg:idem:";
 

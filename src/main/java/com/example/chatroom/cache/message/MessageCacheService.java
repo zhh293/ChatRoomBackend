@@ -172,19 +172,6 @@ public class MessageCacheService {
         return deserialize(values);
     }
 
-    /**
-     * 查询 ZSet 中最小的 score（最老消息的 msgId），用于判断缓存是否覆盖了请求范围
-     * 返回 null 表示 ZSet 不存在或为空
-     */
-    public Long getMinMsgId(Long sessionId, Long userId, Integer memberCount) {
-        String zsetKey = resolveReadKey(sessionId, userId, memberCount);
-        Set<ZSetOperations.TypedTuple<String>> tuples =
-                stringRedisTemplate.opsForZSet().rangeWithScores(zsetKey, 0, 0);
-        if (tuples == null || tuples.isEmpty()) return null;
-        Double score = tuples.iterator().next().getScore();
-        return score != null ? score.longValue() : null;
-    }
-
     // =========================================================================
     // 鉴权：用户是否在会话中
     // =========================================================================
@@ -302,6 +289,97 @@ public class MessageCacheService {
             return RedisKeyConst.MSG_BUF_SHARD + sessionId + ":" + shard;
         }
         return RedisKeyConst.MSG_BUF + sessionId;
+    }
+
+    // =========================================================================
+    // 历史消息翻阅缓存（session 级公共 ZSet，score=msgId，value=消息JSON）
+    // =========================================================================
+
+    /**
+     * 从历史消息 ZSet 中读取指定范围的消息（before 方向）
+     *
+     * <p>key = msg:history:{sessionId}，score = msgId。
+     * 取 score &lt; cursor 的最新 size 条（倒序），cursor=null 表示取最新一页。
+     * 返回 null 表示 ZSet 不存在（key 不存在），调用方需回源 DB。
+     * 返回空列表表示 ZSet 存在但该范围内没有数据。
+     *
+     * @param sessionId 会话 ID
+     * @param cursor    翻页游标（before 方向的 msgId），null 表示首次加载
+     * @param size      每页条数
+     * @return 消息列表（倒序，最新的在前），null 表示 ZSet 不存在
+     */
+    public List<com.example.chatroom.module.message.domain.entity.ChatMessage> getHistoryMessages(
+            Long sessionId, Long cursor, int size) {
+        String key = RedisKeyConst.MSG_HISTORY + sessionId;
+        if (!Boolean.TRUE.equals(stringRedisTemplate.hasKey(key))) {
+            return null; // ZSet 不存在，回源 DB
+        }
+        double maxScore = cursor != null ? (double) cursor - 1 : Double.MAX_VALUE;
+        Set<String> values = stringRedisTemplate.opsForZSet()
+                .reverseRangeByScore(key, 0, maxScore, 0, size);
+        if (values == null || values.isEmpty()) {
+            return null; // 该范围无数据，与 key 不存在统一返回 null，调用方回源 DB
+        }
+        return values.stream()
+                .map(v -> {
+                    try {
+                        return objectMapper.readValue(v,
+                                com.example.chatroom.module.message.domain.entity.ChatMessage.class);
+                    } catch (JsonProcessingException e) {
+                        log.warn("[MessageCache] 历史缓存反序列化失败: {}", v, e);
+                        return null;
+                    }
+                })
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 将 DB 回源的消息批量写入历史消息 ZSet
+     *
+     * <p>score = msgId，value = 消息 JSON。
+     * 每次写入后刷新 TTL = {@link RedisKeyConst#MSG_HISTORY_TTL}（10分钟）。
+     * 写入失败只打 warn 日志，不影响主流程。
+     *
+     * @param sessionId 会话 ID
+     * @param messages  从 DB 查出的消息列表
+     */
+    public void putHistoryMessages(Long sessionId,
+            List<com.example.chatroom.module.message.domain.entity.ChatMessage> messages) {
+        if (messages == null || messages.isEmpty()) return;
+        String key = RedisKeyConst.MSG_HISTORY + sessionId;
+        try {
+            Set<org.springframework.data.redis.core.ZSetOperations.TypedTuple<String>> tuples =
+                    new java.util.HashSet<>(messages.size());
+            for (com.example.chatroom.module.message.domain.entity.ChatMessage msg : messages) {
+                String json = objectMapper.writeValueAsString(msg);
+                tuples.add(org.springframework.data.redis.core.ZSetOperations.TypedTuple
+                        .of(json, (double) msg.getId()));
+            }
+            stringRedisTemplate.opsForZSet().add(key, tuples);
+            stringRedisTemplate.expire(key, RedisKeyConst.MSG_HISTORY_TTL, TimeUnit.SECONDS);
+            log.debug("[MessageCache] 写入历史缓存 {} 条, sessionId={}", messages.size(), sessionId);
+        } catch (JsonProcessingException e) {
+            log.warn("[MessageCache] 历史缓存序列化失败, sessionId={}", sessionId, e);
+        }
+    }
+
+    /**
+     * 从历史消息 ZSet 中删除单条消息（撤回时调用）
+     *
+     * <p>精确删除 score = msgId 的那一条，不影响其他消息。
+     *
+     * @param sessionId 会话 ID
+     * @param msgId     被撤回的消息 ID
+     */
+    public void evictHistoryMessage(Long sessionId, Long msgId) {
+        String key = RedisKeyConst.MSG_HISTORY + sessionId;
+        try {
+            stringRedisTemplate.opsForZSet().removeRangeByScore(key, msgId, msgId);
+            log.debug("[MessageCache] 删除历史缓存单条消息, sessionId={}, msgId={}", sessionId, msgId);
+        } catch (Exception e) {
+            log.warn("[MessageCache] 删除历史缓存消息失败, sessionId={}, msgId={}", sessionId, msgId, e);
+        }
     }
 
     // =========================================================================
