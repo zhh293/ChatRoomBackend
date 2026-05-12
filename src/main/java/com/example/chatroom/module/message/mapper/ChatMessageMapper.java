@@ -35,4 +35,10 @@ public interface ChatMessageMapper extends BaseMapper<ChatMessage> {
     @Select("SELECT COUNT(*) FROM chat_message WHERE session_id = #{sessionId} AND id > #{lastReadMsgId} AND status = 1")
     int countUnread(@Param("sessionId") Long sessionId,
                     @Param("lastReadMsgId") Long lastReadMsgId);
+
+    /**
+     * 根据 msgNo 判断消息是否已入库（走唯一索引 uk_msg_no，带 sessionId 用于分片路由）
+     */
+    @Select("SELECT id FROM chat_message WHERE session_id = #{sessionId} AND msg_no = #{msgNo} LIMIT 1")
+    Long existsByMsgNo(@Param("sessionId") Long sessionId, @Param("msgNo") String msgNo);
 }

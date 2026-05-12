@@ -43,6 +43,11 @@ public enum ResultCode {
     MSG_TYPE_INVALID(40004, "消息类型不合法"),
     ILLEGAL_SESSION(40005, "非法会话，无权发送消息"),
 
+    // 语音通话模块
+    CALL_SESSION_NOT_SINGLE(70001, "语音通话仅支持单聊"),
+    CALL_CALLER_BUSY(70002, "您当前正在通话中"),
+    CALL_CALLEE_BUSY(70003, "对方正在通话中"),
+
     // 上传模块
     UPLOAD_TASK_NOT_FOUND(60001, "上传任务不存在或已过期"),
     UPLOAD_CHUNK_MD5_MISMATCH(60002, "分片 MD5 校验失败，数据已损坏"),

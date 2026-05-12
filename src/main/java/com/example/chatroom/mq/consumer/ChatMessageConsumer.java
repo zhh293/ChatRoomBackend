@@ -4,18 +4,26 @@ import com.example.chatroom.cache.message.MessageCacheService;
 import com.example.chatroom.cache.session.SessionCacheService;
 import com.example.chatroom.common.config.RabbitMQConfig;
 import com.example.chatroom.common.constant.RedisKeyConst;
+import com.example.chatroom.module.call.domain.entity.CallRecord;
+import com.example.chatroom.module.call.domain.enums.CallStatus;
+import com.example.chatroom.module.call.mapper.CallRecordMapper;
 import com.example.chatroom.module.message.domain.entity.ChatMessage;
+import com.example.chatroom.module.message.domain.entity.MsgDeadLetter;
 import com.example.chatroom.module.message.mapper.ChatMessageMapper;
 import com.example.chatroom.module.message.mapper.LocalMsgOutboxMapper;
+import com.example.chatroom.module.message.mapper.MsgDeadLetterMapper;
 import com.example.chatroom.module.session.mapper.SessionMapper;
 import com.example.chatroom.module.websocket.manager.WebSocketSessionManager;
 import com.example.chatroom.mq.dto.ChatMessageMQDTO;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.rabbitmq.client.Channel;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.aop.framework.AopContext;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.context.annotation.EnableAspectJAutoProxy;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -45,12 +53,15 @@ import java.util.concurrent.ThreadPoolExecutor;
 @Slf4j
 @Component
 @RequiredArgsConstructor
+@EnableAspectJAutoProxy(exposeProxy = true)
 public class ChatMessageConsumer {
 
     private final ThreadPoolExecutor msgPersistExecutor;
     private final ChatMessageMapper chatMessageMapper;
     private final LocalMsgOutboxMapper outboxMapper;
+    private final MsgDeadLetterMapper deadLetterMapper;
     private final SessionMapper sessionMapper;
+    private final CallRecordMapper callRecordMapper;
     private final SessionCacheService sessionCacheService;
     private final MessageCacheService messageCacheService;
     private final WebSocketSessionManager wsSessionManager;
@@ -84,11 +95,13 @@ public class ChatMessageConsumer {
 
     private void processWithRetry(String payload, String msgNo) {
         int attempt = 0;
+        Exception lastException = null;
         while (attempt < MAX_RETRY) {
             try {
                 processMessage(payload, msgNo);
                 return; // 成功，退出
             } catch (Exception e) {
+                lastException = e;
                 attempt++;
                 log.warn("[MQ Consumer] 处理消息失败，第{}次重试, msgNo={}, error={}",
                         attempt, msgNo, e.getMessage());
@@ -103,54 +116,68 @@ public class ChatMessageConsumer {
                 }
             }
         }
-        // 3次全部失败：从缓存中删除该消息，记录错误日志（消息已进死信队列）
-        log.error("[MQ Consumer] 消息处理彻底失败，已丢入死信队列, msgNo={}", msgNo);
-        cleanupOnFinalFailure(payload);
+        // 3次全部失败：①清缓存 ②写死信表 ③更新outbox状态 ④通知发送者
+        log.error("[MQ Consumer] 消息处理彻底失败, msgNo={}", msgNo, lastException);
+        handleFinalFailure(payload, lastException);
     }
 
     // =========================================================================
     // 核心处理逻辑
     // =========================================================================
 
-    @Transactional(rollbackFor = Exception.class)
     public void processMessage(String payload, String msgNo) throws Exception {
         ChatMessageMQDTO dto = objectMapper.readValue(payload, ChatMessageMQDTO.class);
 
-        // ① Redis 去重：SET NX，TTL 2min（与发送端幂等 key 共用同一个 key）
-        // 发送端已写过 msgNo→msgId，这里直接判断 key 是否存在
-        // 若 key 不存在（TTL 过期或首次消费），则允许继续处理
+        // ① 幂等判断：Redis 快速过滤 + DB 兜底
+        // 先走 Redis SET NX 快速拦截大部分重复消费
         String idemKey = RedisKeyConst.MSG_IDEM + dto.getMsgNo();
         Boolean isNew = stringRedisTemplate.opsForValue()
                 .setIfAbsent(idemKey, String.valueOf(dto.getMsgId()), 2, java.util.concurrent.TimeUnit.MINUTES);
-        // setIfAbsent 返回 false 说明 key 已存在（发送端写过，或消费端已处理过）
-        // 但发送端写的是 msgNo→msgId，消费端也写同一个 key，所以 false 时需要判断是否已落库
         if (Boolean.FALSE.equals(isNew)) {
-            // Double Check：查 DB 是否已存在该消息（防止 TTL 过期后重复消费）
-            if (chatMessageMapper.selectById(dto.getMsgId()) != null) {
-                log.debug("[MQ Consumer] 消息已落库，跳过, msgId={}", dto.getMsgId());
+            log.debug("[MQ Consumer]发现重复消息,跳过，msgNo={}",dto.getMsgNo());
+            return;
+        } else {
+            // Redis key 不存在（可能 TTL 过期），仍需查 DB 兜底防止重复入库
+            if (chatMessageMapper.existsByMsgNo(dto.getSessionId(), dto.getMsgNo()) != null) {
+                log.debug("[MQ Consumer] Redis key 过期但DB已存在，跳过, msgNo={}", dto.getMsgNo());
                 return;
             }
-            // key 存在但 DB 没有 → 发送端刚写的 key，消费端首次处理，继续
         }
 
-        // ② 写 chat_message 分片表
+        // ② 通过代理对象调用，确保 @Transactional 生效
+        ChatMessageConsumer proxy = (ChatMessageConsumer) AopContext.currentProxy();
+        proxy.persistInTransaction(dto);
+
+        // ③ 失效 session info 缓存（非事务操作，DB 已提交后再做）
+        sessionCacheService.evict(dto.getSessionId());
+
+        // ④ 推送：遍历会话成员，在线推 WebSocket
+        pushToMembers(dto);
+    }
+
+    /**
+     * 事务仅包裹纯 DB 操作：写消息 + 写通话记录 + 更新会话最后一条消息 + 更新 outbox 状态
+     * 任一失败整体回滚，外层重试
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public void persistInTransaction(ChatMessageMQDTO dto) {
+        // 写 chat_message 分片表
         ChatMessage chatMessage = buildChatMessage(dto);
         chatMessageMapper.insert(chatMessage);
 
-        // ③ 更新 session.last_msg_id / last_msg_content / last_msg_at
+        // 语音通话消息：额外写 call_record，状态机设为 INVITING
+        if (dto.getMsgType() != null && dto.getMsgType() == 7) {
+            insertCallRecord(dto);
+        }
+
+        // 更新 session.last_msg_id / last_msg_content / last_msg_at
         LocalDateTime msgAt = LocalDateTime.ofInstant(
                 Instant.ofEpochMilli(dto.getTimestamp()), ZoneId.systemDefault());
         String lastMsgContent = buildLastMsgContent(dto);
         sessionMapper.updateLastMsg(dto.getSessionId(), dto.getMsgId(), lastMsgContent, msgAt);
 
-        // 同步失效 session info 缓存（下次读时重建，保证 last_msg 字段最新）
-        sessionCacheService.evict(dto.getSessionId());
-
-        // ④ 更新 local_msg_outbox.status=2（只能从 status=0/1 更新，防止重复）
+        // 更新 local_msg_outbox.status=2
         outboxMapper.updateStatusByMsgNo(dto.getMsgNo(), 2);
-
-        // ⑤ 推送：遍历会话成员，在线推 WebSocket，离线存 Redis List
-        pushToMembers(dto);
     }
 
     // =========================================================================
@@ -200,15 +227,91 @@ public class ChatMessageConsumer {
     }
 
     // =========================================================================
-    // 失败兜底：从缓存删除消息
+    // 失败兜底：① 清缓存 ② 写死信表 ③ 更新 outbox 状态 ④ 通知发送者
     // =========================================================================
 
-    private void cleanupOnFinalFailure(String payload) {
+    private void handleFinalFailure(String payload, Exception lastException) {
+        ChatMessageMQDTO dto;
         try {
-            ChatMessageMQDTO dto = objectMapper.readValue(payload, ChatMessageMQDTO.class);
+            dto = objectMapper.readValue(payload, ChatMessageMQDTO.class);
+        } catch (Exception e) {
+            log.error("[MQ Consumer] 最终失败处理：反序列化失败，无法兜底, payload={}", payload, e);
+            return;
+        }
+
+        // ① 清除 ZSet 缓存中的消息，避免用户看到「幽灵消息」
+        try {
             messageCacheService.removeMessage(dto.getSessionId(), dto.getMsgId());
         } catch (Exception e) {
-            log.error("[MQ Consumer] 清理缓存失败", e);
+            log.error("[MQ Consumer] 清理缓存失败, msgNo={}", dto.getMsgNo(), e);
+        }
+
+        // ② 写死信表，保留消息全貌供人工排查
+        try {
+            saveToDeadLetter(dto, payload, lastException);
+        } catch (Exception e) {
+            log.error("[MQ Consumer] 写死信表失败, msgNo={}", dto.getMsgNo(), e);
+        }
+
+        // ③ 更新 outbox 状态为 3（消费失败）
+        try {
+            outboxMapper.updateStatusByMsgNo(dto.getMsgNo(), 3);
+        } catch (Exception e) {
+            log.error("[MQ Consumer] 更新outbox状态失败, msgNo={}", dto.getMsgNo(), e);
+        }
+
+        // ④ WebSocket 通知发送者：消息发送失败
+        try {
+            notifySenderFailed(dto);
+        } catch (Exception e) {
+            log.error("[MQ Consumer] 通知发送者失败, msgNo={}", dto.getMsgNo(), e);
+        }
+    }
+
+    /**
+     * 写入死信表：完整保存消息关键信息 + 失败原因，供人工介入或自动重试
+     */
+    private void saveToDeadLetter(ChatMessageMQDTO dto, String rawPayload, Exception ex) {
+        MsgDeadLetter deadLetter = new MsgDeadLetter();
+        deadLetter.setMsgId(dto.getMsgId());
+        deadLetter.setMsgNo(dto.getMsgNo());
+        deadLetter.setSessionId(dto.getSessionId());
+        deadLetter.setSenderId(dto.getSenderId());
+        deadLetter.setMsgType(dto.getMsgType());
+        deadLetter.setContent(dto.getContent());
+        deadLetter.setExtra(dto.getExtra());
+        deadLetter.setReplyMsgId(dto.getReplyMsgId());
+        deadLetter.setRawPayload(rawPayload);
+        deadLetter.setFailReason(ex != null ? ex.getClass().getSimpleName() + ": " + ex.getMessage() : "unknown");
+        deadLetter.setRetryCount(MAX_RETRY);
+        deadLetter.setStatus(0); // 0-待处理
+        deadLetterMapper.insert(deadLetter);
+        log.warn("[MQ Consumer] 消息已写入死信表, msgNo={}, failReason={}", dto.getMsgNo(), deadLetter.getFailReason());
+    }
+
+    /**
+     * WebSocket 通知发送者：你的消息发送失败了
+     * 前端收到后可展示红色感叹号 + 「重发」按钮
+     */
+    private void notifySenderFailed(ChatMessageMQDTO dto) {
+        String failNotice = String.format(
+                "{\"type\":\"msg_send_failed\",\"msgNo\":\"%s\",\"msgId\":%d,\"sessionId\":%d}",
+                dto.getMsgNo(), dto.getMsgId(), dto.getSessionId());
+
+        if (wsSessionManager.isLocalOnline(dto.getSenderId())) {
+            wsSessionManager.pushToLocal(dto.getSenderId(), failNotice);
+        } else {
+            // 可能在其他节点在线，走 Pub/Sub
+            String onlineKey = RedisKeyConst.WS_ONLINE + dto.getSenderId();
+            java.util.Map<Object, Object> onlineNodes =
+                    stringRedisTemplate.opsForHash().entries(onlineKey);
+            for (Object nodeId : onlineNodes.keySet()) {
+                if (MACHINE_ID.equals(nodeId.toString())) continue;
+                String pushChannel = RedisKeyConst.WS_PUSH_CHANNEL_PREFIX + nodeId;
+                String pushPayload = buildPushPayload(dto.getSenderId(), failNotice);
+                stringRedisTemplate.convertAndSend(pushChannel, pushPayload);
+            }
+            // 如果完全离线，前端上线后凭 outbox.status=3 也能感知失败，无需额外处理
         }
     }
 
@@ -243,11 +346,43 @@ public class ChatMessageConsumer {
             case 3 -> "[语音]";
             case 4 -> "[视频]";
             case 5 -> "[文件]";
+            case 7 -> "[语音通话]";
             default -> "[消息]";
         };
     }
 
     private String buildPushPayload(Long userId, String message) {
         return String.format("{\"userId\":%d,\"message\":%s}", userId, message);
+    }
+
+    // =========================================================================
+    // 语音通话：写入 call_record
+    // =========================================================================
+
+    /**
+     * 从 MQ DTO 的 extra 字段解析 callId、calleeId，写入 call_record
+     * 状态机初始状态：INVITING（邀请中）
+     */
+    private void insertCallRecord(ChatMessageMQDTO dto) {
+        try {
+            JsonNode extraNode = objectMapper.readTree(dto.getExtra());
+            long callId = extraNode.get("callId").asLong();
+            long calleeId = extraNode.get("calleeId").asLong();
+
+            CallRecord record = new CallRecord();
+            record.setId(callId); // 使用 callId 作为主键
+            record.setCallId(callId);
+            record.setSessionId(dto.getSessionId());
+            record.setMessageId(dto.getMsgId());
+            record.setCallerId(dto.getSenderId());
+            record.setCalleeId(calleeId);
+            record.setStatus(CallStatus.INVITING.name());
+            callRecordMapper.insert(record);
+
+            log.info("[MQ Consumer] 写入 call_record, callId={}, status=INVITING", callId);
+        } catch (Exception e) {
+            log.error("[MQ Consumer] 写入 call_record 失败, msgId={}", dto.getMsgId(), e);
+            throw new RuntimeException("写入 call_record 失败", e);
+        }
     }
 }
