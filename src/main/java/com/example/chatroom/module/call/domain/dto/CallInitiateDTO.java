@@ -14,6 +14,10 @@ public class CallInitiateDTO {
     @NotNull(message = "会话ID不能为空")
     private Long sessionId;
 
+    /** 被叫用户ID（前端从会话成员列表中获取） */
+    @NotNull(message = "被叫用户ID不能为空")
+    private Long calleeId;
+
     /** 客户端生成的幂等编号（UUID） */
     @NotBlank(message = "消息编号不能为空")
     private String msgNo;

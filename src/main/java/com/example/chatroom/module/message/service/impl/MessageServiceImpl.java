@@ -19,6 +19,7 @@ import com.example.chatroom.module.session.domain.entity.Session;
 import com.example.chatroom.module.session.domain.entity.SessionMember;
 import com.example.chatroom.module.session.mapper.SessionMemberMapper;
 import com.example.chatroom.mq.dto.ChatMessageMQDTO;
+import com.example.chatroom.common.delay.DelayQueueService;
 import com.example.chatroom.mq.producer.ChatMessageProducer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -62,6 +63,7 @@ public class MessageServiceImpl implements MessageService {
     private final ChatMessageMapper chatMessageMapper;
     private final SessionMemberMapper sessionMemberMapper;
     private final ChatMessageProducer mqProducer;
+    private final DelayQueueService delayQueueService;
     private final SnowflakeIdGenerator idGenerator;
     private final SessionCacheService sessionCacheService;
     private final MessageCacheService messageCacheService;
@@ -153,6 +155,9 @@ public class MessageServiceImpl implements MessageService {
 
             // ⑧ 发送到 RabbitMQ（Publisher Confirm）
             mqProducer.sendWithConfirm(outbox.getPayload(), dto.getMsgNo());
+
+            // ⑧.5 投递延迟任务：30s 后检查 outbox 是否已落库
+            delayQueueService.addTask(dto.getMsgNo(), 30);
 
         } catch (Exception e) {
             // ⑦⑧ 失败：回滚 ZSet 缓存中的消息

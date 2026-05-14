@@ -149,6 +149,14 @@ public interface RedisKeyConst {
     // ===== 空值标记 =====
     String NULL_VALUE = "NULL_VALUE";
 
+    // ===== 延迟队列（Outbox 补偿） =====
+    /** 延迟队列 ZSet：score = 到期时间戳(ms)，value = msgNo */
+    String DELAY_QUEUE = "delay:outbox:queue";
+    /** 就绪队列 List：到期任务 LPUSH 到这里，消费者 BRPOP */
+    String DELAY_READY = "delay:outbox:ready";
+    /** 处理中队列 ZSet：score = 处理超时时间戳(ms)，value = msgNo */
+    String DELAY_PROCESSING = "delay:outbox:processing";
+
     // ===== 分片上传 =====
     /**
      * 上传任务元信息（Hash）

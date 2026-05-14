@@ -61,6 +61,10 @@ public interface LocalMsgOutboxMapper extends BaseMapper<LocalMsgOutbox> {
     int deleteArchivedBatch(@Param("threshold") LocalDateTime threshold,
                             @Param("batchSize") int batchSize);
 
+    /** 根据 msgNo 查询单条记录（延迟队列消费时使用） */
+    @Select("SELECT * FROM local_msg_outbox WHERE msg_no = #{msgNo} LIMIT 1")
+    LocalMsgOutbox selectByMsgNo(@Param("msgNo") String msgNo);
+
     /** 根据 msgNo 更新状态（Publisher Confirm 回调用） */
     @Update("UPDATE local_msg_outbox SET status = #{status} WHERE msg_no = #{msgNo}")
     int updateStatusByMsgNo(@Param("msgNo") String msgNo, @Param("status") int status);
