@@ -27,7 +27,7 @@ import java.util.List;
  * <h3>XXL-Job 配置</h3>
  * <pre>
  * JobHandler : outboxCompensateJobHandler
- * Cron       : 0 0/5 * * * ?（每 5 分钟）
+ * Cron       : 0 0 0/12 * * ?（每 12 小时）
  * 路由策略   : 分片广播（SHARDING_BROADCAST）
  * 超时       : 30s
  * 失败重试   : 0
@@ -35,8 +35,8 @@ import java.util.List;
  *
  * <h3>核心逻辑</h3>
  * <pre>
- * 只捞 created_at < NOW() - 5min 且 status IN (0, 1) 的记录。
- * 正常消息通过延迟队列在 30s 内就处理了，5 分钟还没完成的说明延迟队列也没兜住。
+ * 只捞 created_at < NOW() - 30min 且 status IN (0, 1) 的记录。
+ * 正常消息通过延迟队列在 30s 内就处理了，30 分钟还没完成的说明延迟队列也没兜住。
  * 扫到后不直接投 MQ，而是重新加入延迟队列（addTask），让延迟队列统一处理。
  * 如果延迟队列本身故障，才直接投 MQ。
  * </pre>
@@ -50,8 +50,8 @@ public class OutboxCompensateJobHandler {
     private static final int BATCH_SIZE = 100;
     /** 单次任务最大处理条数 */
     private static final int MAX_PROCESS = 300;
-    /** 兜底超时阈值（秒）：5 分钟前仍未落库的才捞 */
-    private static final int FALLBACK_TIMEOUT_SECONDS = 300;
+    /** 兜底超时阈值（秒）：30 分钟前仍未落库的才捞 */
+    private static final int FALLBACK_TIMEOUT_SECONDS = 1800;
 
     private final LocalMsgOutboxMapper outboxMapper;
     private final DelayQueueService delayQueueService;
