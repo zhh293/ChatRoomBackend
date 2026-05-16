@@ -203,8 +203,8 @@ public class MessageServiceImpl implements MessageService {
 
         if ("after".equals(direction)) {
             // ---------------------------------------------------------------
-            // after 方向：追新消息，ZSet 热缓存通常必然命中，miss 直接回源 DB 兜底
-            // 不做补查合并，after 场景极少走到 DB
+            // after 方向：追新消息 / 拉取未读消息
+            // ZSet 热缓存通常必然命中，miss 回源 DB（selectAfter: id > cursor ASC）
             // ---------------------------------------------------------------
             List<ChatMessageMQDTO> cached = messageCacheService.getMessagesAfter(
                     sessionId, userId, memberCount, cursor, safeSize);
@@ -213,11 +213,13 @@ public class MessageServiceImpl implements MessageService {
                 hasMore = cached.size() == safeSize;
                 nextCursor = voList.get(voList.size() - 1).getMsgId();
             } else {
+                // DB 兜底：cursor=null 取最新 N 条；否则取 id > cursor 的消息（ASC）
                 List<ChatMessage> dbList = cursor == null
                         ? chatMessageMapper.selectLatest(sessionId, safeSize)
-                        : chatMessageMapper.selectBefore(sessionId, cursor, safeSize);
+                        : chatMessageMapper.selectAfter(sessionId, cursor, safeSize);
                 voList = dbList.stream().map(this::toVO).collect(Collectors.toList());
-                Collections.reverse(voList);
+                // selectAfter 已经是 ASC 正序，无需 reverse
+                if (cursor == null) Collections.reverse(voList); // selectLatest 是 DESC，需要反转
                 hasMore = dbList.size() == safeSize;
                 nextCursor = voList.isEmpty() ? null : voList.get(voList.size() - 1).getMsgId();
             }
