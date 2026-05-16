@@ -17,7 +17,9 @@ import com.example.chatroom.module.message.mapper.LocalMsgOutboxMapper;
 import com.example.chatroom.module.message.service.MessageService;
 import com.example.chatroom.module.session.domain.entity.Session;
 import com.example.chatroom.module.session.domain.entity.SessionMember;
+import com.example.chatroom.module.session.mapper.SessionMapper;
 import com.example.chatroom.module.session.mapper.SessionMemberMapper;
+import com.example.chatroom.module.websocket.service.WsPushService;
 import com.example.chatroom.mq.dto.ChatMessageMQDTO;
 import com.example.chatroom.common.delay.DelayQueueService;
 import com.example.chatroom.mq.producer.ChatMessageProducer;
@@ -62,6 +64,7 @@ public class MessageServiceImpl implements MessageService {
     private final LocalMsgOutboxMapper outboxMapper;
     private final ChatMessageMapper chatMessageMapper;
     private final SessionMemberMapper sessionMemberMapper;
+    private final SessionMapper sessionMapper;
     private final ChatMessageProducer mqProducer;
     private final DelayQueueService delayQueueService;
     private final SnowflakeIdGenerator idGenerator;
@@ -69,6 +72,7 @@ public class MessageServiceImpl implements MessageService {
     private final MessageCacheService messageCacheService;
     private final RedissonClient redissonClient;
     private final ObjectMapper objectMapper;
+    private final WsPushService wsPushService;
 
     private static final String MSG_IDEM_LOCK_PREFIX = "lock:msg:idem:";
 
@@ -319,6 +323,18 @@ public class MessageServiceImpl implements MessageService {
         Session session = sessionCacheService.getSessionById(msg.getSessionId());
         Integer memberCount = session != null ? session.getMemberCount() : null;
         messageCacheService.revokeMessageCache(msg.getSessionId(), msgId, memberCount);
+
+        // 会话摘要联动：如果被撤回的恰好是会话最后一条消息，更新摘要为"撤回了一条消息"
+        sessionMapper.updateLastMsgContentIfMatch(msg.getSessionId(), msgId, "撤回了一条消息");
+        // 失效会话缓存，让会话列表下次加载时拿到最新摘要
+        sessionCacheService.evict(msg.getSessionId());
+
+        // 异步推送撤回通知给会话在线成员，前端收到后本地替换消息为"已撤回"
+        // 不阻塞接口返回，推送失败靠前端下次拉取 DB status=2 兜底
+        String revokeNotify = String.format(
+                "{\"type\":\"msg_revoked\",\"msgId\":%d,\"sessionId\":%d,\"operatorId\":%d}",
+                msgId, msg.getSessionId(), userId);
+        wsPushService.pushToSessionMembersAsync(msg.getSessionId(), null, revokeNotify);
     }
 
     // =========================================================================
@@ -389,7 +405,7 @@ public class MessageServiceImpl implements MessageService {
         vo.setContent(dto.getContent());
         vo.setExtra(dto.getExtra());
         vo.setReplyMsgId(dto.getReplyMsgId());
-        vo.setStatus(1); // ZSet 中的消息均为正常状态
+        vo.setStatus(dto.getStatus() != null ? dto.getStatus() : 1);
         if (dto.getTimestamp() != null) {
             vo.setCreatedAt(java.time.LocalDateTime.ofInstant(
                     java.time.Instant.ofEpochMilli(dto.getTimestamp()),
@@ -427,6 +443,7 @@ public class MessageServiceImpl implements MessageService {
         mqDTO.setReplyMsgId(dto.getReplyMsgId());
         mqDTO.setTimestamp(System.currentTimeMillis());
         mqDTO.setMemberCount(session.getMemberCount());
+        mqDTO.setStatus(1); // 初始状态=正常，撤回时 Lua 脚本会在缓存中原子更新为2
         return mqDTO;
     }
 

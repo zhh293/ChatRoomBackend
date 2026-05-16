@@ -213,6 +213,7 @@ public class CallServiceImpl implements CallService {
         mqDTO.setExtra(buildExtra(callId, calleeId));
         mqDTO.setTimestamp(System.currentTimeMillis());
         mqDTO.setMemberCount(session.getMemberCount());
+        mqDTO.setStatus(1); // 初始状态=正常
         return mqDTO;
     }
 

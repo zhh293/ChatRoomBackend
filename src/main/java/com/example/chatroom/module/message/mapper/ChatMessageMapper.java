@@ -17,7 +17,7 @@ public interface ChatMessageMapper extends BaseMapper<ChatMessage> {
     /**
      * 游标向上翻页（加载更早的消息）
      */
-    @Select("SELECT * FROM chat_message WHERE session_id = #{sessionId} AND id < #{cursor} AND status = 1 ORDER BY id DESC LIMIT #{size}")
+    @Select("SELECT * FROM chat_message WHERE session_id = #{sessionId} AND id < #{cursor} AND status IN (1, 2) ORDER BY id DESC LIMIT #{size}")
     List<ChatMessage> selectBefore(@Param("sessionId") Long sessionId,
                                    @Param("cursor") Long cursor,
                                    @Param("size") int size);
@@ -25,7 +25,7 @@ public interface ChatMessageMapper extends BaseMapper<ChatMessage> {
     /**
      * 首次加载（取最新 N 条）
      */
-    @Select("SELECT * FROM chat_message WHERE session_id = #{sessionId} AND status = 1 ORDER BY id DESC LIMIT #{size}")
+    @Select("SELECT * FROM chat_message WHERE session_id = #{sessionId} AND status IN (1, 2) ORDER BY id DESC LIMIT #{size}")
     List<ChatMessage> selectLatest(@Param("sessionId") Long sessionId,
                                    @Param("size") int size);
 
