@@ -203,8 +203,8 @@ public class MessageServiceImpl implements MessageService {
 
         if ("after".equals(direction)) {
             // ---------------------------------------------------------------
-            // after 方向：追新消息 / 拉取未读消息
-            // ZSet 热缓存通常必然命中，miss 回源 DB（selectAfter: id > cursor ASC）
+            // after 方向：追新消息，ZSet 热缓存通常必然命中，miss 直接回源 DB 兜底
+            // 不做补查合并，after 场景极少走到 DB
             // ---------------------------------------------------------------
             List<ChatMessageMQDTO> cached = messageCacheService.getMessagesAfter(
                     sessionId, userId, memberCount, cursor, safeSize);
@@ -213,13 +213,11 @@ public class MessageServiceImpl implements MessageService {
                 hasMore = cached.size() == safeSize;
                 nextCursor = voList.get(voList.size() - 1).getMsgId();
             } else {
-                // DB 兜底：cursor=null 取最新 N 条；否则取 id > cursor 的消息（ASC）
                 List<ChatMessage> dbList = cursor == null
                         ? chatMessageMapper.selectLatest(sessionId, safeSize)
-                        : chatMessageMapper.selectAfter(sessionId, cursor, safeSize);
+                        : chatMessageMapper.selectBefore(sessionId, cursor, safeSize);
                 voList = dbList.stream().map(this::toVO).collect(Collectors.toList());
-                // selectAfter 已经是 ASC 正序，无需 reverse
-                if (cursor == null) Collections.reverse(voList); // selectLatest 是 DESC，需要反转
+                Collections.reverse(voList);
                 hasMore = dbList.size() == safeSize;
                 nextCursor = voList.isEmpty() ? null : voList.get(voList.size() - 1).getMsgId();
             }
@@ -326,10 +324,6 @@ public class MessageServiceImpl implements MessageService {
         Integer memberCount = session != null ? session.getMemberCount() : null;
         messageCacheService.revokeMessageCache(msg.getSessionId(), msgId, memberCount);
 
-        // 会话摘要联动：如果被撤回的恰好是会话最后一条消息，更新摘要为"撤回了一条消息"
-        sessionMapper.updateLastMsgContentIfMatch(msg.getSessionId(), msgId, "撤回了一条消息");
-        // 失效会话缓存，让会话列表下次加载时拿到最新摘要
-        sessionCacheService.evict(msg.getSessionId());
 
         // 异步推送撤回通知给会话在线成员，前端收到后本地替换消息为"已撤回"
         // 不阻塞接口返回，推送失败靠前端下次拉取 DB status=2 兜底
