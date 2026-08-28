@@ -34,6 +34,7 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 聊天消息 RabbitMQ 消费者
@@ -41,7 +42,7 @@ import java.util.List;
  *
  * <h3>消费流程</h3>
  * <pre>
- * ① Redis 去重（MSG_IDEM SET NX，TTL 2min）
+ * ① Redis 消费完成标记快速去重，DB 唯一索引最终兜底
  * ② 写 chat_message 分片表
  * ③ 更新 session.last_msg_id / last_msg_content / last_msg_at
  * ④ 更新 local_msg_outbox.status=2（已消费落库）
@@ -127,27 +128,23 @@ public class ChatMessageConsumer {
     public void processMessage(String payload, String msgNo) throws Exception {
         ChatMessageMQDTO dto = objectMapper.readValue(payload, ChatMessageMQDTO.class);
 
-        // ① 幂等判断：Redis 快速过滤 + DB 兜底
-        // 先走 Redis SET NX 快速拦截大部分重复消费
-        String idemKey = RedisKeyConst.MSG_IDEM + dto.getMsgNo();
-        Boolean isNew = stringRedisTemplate.opsForValue()
-                .setIfAbsent(idemKey, String.valueOf(dto.getMsgId()), 2, java.util.concurrent.TimeUnit.MINUTES);
-        if (Boolean.FALSE.equals(isNew)) {
-            log.debug("[MQ Consumer]发现重复消息,跳过，msgNo={}",dto.getMsgNo());
+        // 请求去重与消费去重必须使用不同命名空间。
+        // 消费完成标记只能在全部处理成功后写入，避免失败重试被误判为重复消息。
+        String consumeDoneKey = RedisKeyConst.MSG_CONSUME_DONE + dto.getMsgNo();
+        if (isConsumeDone(consumeDoneKey)) {
+            log.debug("[MQ Consumer] 消息已消费完成，跳过, msgNo={}", dto.getMsgNo());
             return;
-        } else {
-            // Redis key 不存在（可能 TTL 过期），仍需查 DB 兜底防止重复入库
-            if (chatMessageMapper.existsByMsgNo(dto.getSessionId(), dto.getMsgNo()) != null) {
-                log.debug("[MQ Consumer] Redis key 过期但DB已存在，跳过, msgNo={}", dto.getMsgNo());
-                return;
-            }
         }
 
-        // ② 通过代理对象调用，确保 @Transactional 生效
-        ChatMessageConsumer proxy = (ChatMessageConsumer) AopContext.currentProxy();
-        proxy.persistInTransaction(dto);
+        // Redis 标记丢失或过期时查 DB。若 DB 已存在，说明事务已提交但后置处理
+        // 可能尚未完成，继续执行缓存失效和推送，保证至少一次投递语义。
+        if (chatMessageMapper.existsByMsgNo(dto.getSessionId(), dto.getMsgNo()) == null) {
+            // 通过代理对象调用，确保 @Transactional 生效；DB 唯一索引兜底并发重复入库。
+            ChatMessageConsumer proxy = (ChatMessageConsumer) AopContext.currentProxy();
+            proxy.persistInTransaction(dto);
+        }
 
-        // ②.5 落库成功，主动移除延迟队列中的任务（避免到期空跑）
+        // 落库成功，主动移除延迟队列中的任务（避免到期空跑）
         delayQueueService.removeTask(dto.getMsgNo());
 
         // ③ 失效 session info 缓存（非事务操作，DB 已提交后再做）
@@ -155,6 +152,30 @@ public class ChatMessageConsumer {
 
         // ④ 推送：遍历会话成员，在线推 WebSocket
         pushToMembers(dto);
+
+        // 所有业务步骤完成后再标记成功。Redis 故障不影响正确性，DB 唯一索引仍可兜底。
+        markConsumeDone(consumeDoneKey, dto.getMsgId());
+    }
+
+    private boolean isConsumeDone(String consumeDoneKey) {
+        try {
+            return Boolean.TRUE.equals(stringRedisTemplate.hasKey(consumeDoneKey));
+        } catch (Exception e) {
+            log.warn("[MQ Consumer] 查询消费幂等标记失败，降级到DB判断, key={}", consumeDoneKey, e);
+            return false;
+        }
+    }
+
+    private void markConsumeDone(String consumeDoneKey, Long msgId) {
+        try {
+            stringRedisTemplate.opsForValue().set(
+                    consumeDoneKey,
+                    String.valueOf(msgId),
+                    RedisKeyConst.MSG_CONSUME_DONE_TTL,
+                    TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("[MQ Consumer] 写入消费幂等标记失败，后续由DB唯一索引兜底, key={}", consumeDoneKey, e);
+        }
     }
 
     /**

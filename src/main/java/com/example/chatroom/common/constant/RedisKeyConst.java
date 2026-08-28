@@ -105,7 +105,14 @@ public interface RedisKeyConst {
     int MSG_HISTORY_TTL = 600;
 
     // ===== 消息幂等 =====
-    String MSG_IDEM = "msg:idem:";
+    /** 客户端发送请求去重：msgNo -> msgId */
+    String MSG_REQUEST_IDEM = "msg:request:idem:";
+
+    /** MQ 消费完成标记：仅在业务处理全部成功后写入 */
+    String MSG_CONSUME_DONE = "msg:consume:done:";
+
+    /** MQ 消费完成标记 TTL（秒，7天）；过期后仍由数据库唯一索引兜底 */
+    int MSG_CONSUME_DONE_TTL = 604800;
 
     // ===== Token 黑名单 =====
     String TOKEN_BLACKLIST = "token:blacklist:";

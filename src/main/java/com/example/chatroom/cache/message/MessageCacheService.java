@@ -206,7 +206,7 @@ public class MessageCacheService {
      * SET NX 写入 msgNo → msgId，首次写入返回 true，重复返回 false
      */
     public boolean setMsgIdIfAbsent(String msgNo, Long msgId) {
-        String key = RedisKeyConst.MSG_IDEM + msgNo;
+        String key = RedisKeyConst.MSG_REQUEST_IDEM + msgNo;
         Boolean ok = stringRedisTemplate.opsForValue()
                 .setIfAbsent(key, String.valueOf(msgId), 2, TimeUnit.MINUTES);
         return Boolean.TRUE.equals(ok);
@@ -216,7 +216,7 @@ public class MessageCacheService {
      * 获取已暂存的 msgId（重复请求时返回给前端）
      */
     public Long getMsgId(String msgNo) {
-        String key = RedisKeyConst.MSG_IDEM + msgNo;
+        String key = RedisKeyConst.MSG_REQUEST_IDEM + msgNo;
         String val = stringRedisTemplate.opsForValue().get(key);
         return val != null ? Long.parseLong(val) : null;
     }
