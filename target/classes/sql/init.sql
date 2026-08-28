@@ -194,3 +194,52 @@ CREATE TABLE IF NOT EXISTS `system_notification` (
   PRIMARY KEY (`id`),
   KEY `idx_user_read` (`user_id`, `is_read`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 通话记录表
+CREATE TABLE IF NOT EXISTS `call_record` (
+  `id`            BIGINT       NOT NULL COMMENT '通话ID（雪花算法，与callId一致）',
+  `call_id`       BIGINT       NOT NULL COMMENT '通话唯一标识',
+  `session_id`    BIGINT       NOT NULL COMMENT '所属会话ID',
+  `message_id`    BIGINT       NOT NULL COMMENT '关联的消息ID',
+  `caller_id`     BIGINT       NOT NULL COMMENT '主叫用户ID',
+  `callee_id`     BIGINT       NOT NULL COMMENT '被叫用户ID',
+  `status`        VARCHAR(32)  NOT NULL COMMENT '通话状态（状态机枚举值）',
+  `start_time`    DATETIME     DEFAULT NULL COMMENT '通话接通时间',
+  `end_time`      DATETIME     DEFAULT NULL COMMENT '通话结束时间',
+  `duration`      INT          DEFAULT 0 COMMENT '通话时长（秒）',
+  `end_reason`    VARCHAR(32)  DEFAULT NULL COMMENT '结束原因（枚举值）',
+  `created_at`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_call_id` (`call_id`),
+  KEY `idx_session_id` (`session_id`),
+  KEY `idx_caller_id` (`caller_id`),
+  KEY `idx_callee_id` (`callee_id`),
+  KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='语音通话记录表';
+
+-- 消息死信表（重试彻底失败后落库，保留完整信息供人工介入修复）
+CREATE TABLE IF NOT EXISTS `msg_dead_letter` (
+  `id`            BIGINT       NOT NULL AUTO_INCREMENT,
+  `msg_id`        BIGINT       NOT NULL COMMENT '消息ID（雪花算法）',
+  `msg_no`        VARCHAR(64)  NOT NULL COMMENT '消息业务编号（幂等键）',
+  `session_id`    BIGINT       NOT NULL COMMENT '会话ID',
+  `session_no`    VARCHAR(64)  DEFAULT NULL COMMENT '会话编号',
+  `sender_id`     BIGINT       NOT NULL COMMENT '发送者ID',
+  `msg_type`      TINYINT      NOT NULL COMMENT '消息类型',
+  `content`       TEXT         DEFAULT NULL COMMENT '消息内容',
+  `extra`         JSON         DEFAULT NULL COMMENT '扩展字段JSON',
+  `reply_msg_id`  BIGINT       DEFAULT NULL COMMENT '回复消息ID',
+  `msg_timestamp` BIGINT       DEFAULT NULL COMMENT '消息发送时间戳(ms)',
+  `member_count`  INT          DEFAULT NULL COMMENT '会话成员数',
+  `fail_reason`   VARCHAR(512) DEFAULT NULL COMMENT '最后一次失败原因',
+  `retry_count`   INT          DEFAULT 0 COMMENT '已重试次数',
+  `status`        TINYINT      DEFAULT 0 COMMENT '0待处理 1已人工修复 2已放弃',
+  `raw_payload`   TEXT         NOT NULL COMMENT 'MQ原始payload（完整JSON兜底）',
+  `created_at`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_msg_no` (`msg_no`),
+  KEY `idx_status` (`status`),
+  KEY `idx_session_id` (`session_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='消息死信表';
