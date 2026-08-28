@@ -1,6 +1,9 @@
 package com.example.chatroom.module.netty.handler;
 
 import com.example.chatroom.module.netty.manager.NettyChannelManager;
+import com.example.chatroom.module.websocket.service.WebSocketAckManager;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -28,6 +31,8 @@ import lombok.extern.slf4j.Slf4j;
 public class WebSocketFrameHandler extends SimpleChannelInboundHandler<WebSocketFrame> {
 
     private final NettyChannelManager channelManager;
+    private final ObjectMapper objectMapper;
+    private final WebSocketAckManager ackManager;
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, WebSocketFrame frame) {
@@ -51,6 +56,23 @@ public class WebSocketFrameHandler extends SimpleChannelInboundHandler<WebSocket
         Long userId = ctx.channel().attr(NettyChannelManager.USER_ID_KEY).get();
 
         log.debug("[Netty Frame] 收到上行消息, userId={}, payload={}", userId, payload);
+
+        try {
+            JsonNode root = objectMapper.readTree(payload);
+            if ("MESSAGE_ACK".equals(root.path("type").asText())) {
+                long msgId = root.path("msgId").asLong(0L);
+                long sessionId = root.path("sessionId").asLong(0L);
+                if (userId == null || msgId <= 0 || sessionId <= 0) {
+                    log.warn("[Netty Frame] 非法 MESSAGE_ACK, userId={}, payload={}", userId, payload);
+                    return;
+                }
+                ackManager.acknowledge(userId, msgId, sessionId);
+                return;
+            }
+        } catch (Exception e) {
+            log.warn("[Netty Frame] 无法解析上行消息, userId={}, payload={}", userId, payload, e);
+            return;
+        }
 
         /*
          * TODO: 根据 type 字段路由到具体业务处理器

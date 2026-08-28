@@ -2,6 +2,8 @@ package com.example.chatroom.module.websocket.handler;
 
 import com.example.chatroom.common.util.JwtUtil;
 import com.example.chatroom.module.websocket.manager.WebSocketSessionManager;
+import com.example.chatroom.module.websocket.service.WebSocketAckManager;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.jsonwebtoken.Claims;
 import lombok.RequiredArgsConstructor;
@@ -39,6 +41,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     private final WebSocketSessionManager sessionManager;
     private final RedisTemplate<String, Object> redisTemplate;
     private final ObjectMapper objectMapper;
+    private final WebSocketAckManager ackManager;
 
     private static final String WS_ONLINE_KEY_PREFIX = "ws:online:";
     private static final String WS_SYNC_CHANNEL = "ws:sync";
@@ -82,7 +85,23 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             }
             return;
         }
-        // TODO: 处理其他上行消息类型
+        try {
+            JsonNode root = objectMapper.readTree(payload);
+            if ("MESSAGE_ACK".equals(root.path("type").asText())) {
+                Long userId = (Long) session.getAttributes().get("userId");
+                long msgId = root.path("msgId").asLong(0L);
+                long sessionId = root.path("sessionId").asLong(0L);
+                if (userId == null || msgId <= 0 || sessionId <= 0) {
+                    log.warn("[WS] 非法 MESSAGE_ACK, userId={}, payload={}", userId, payload);
+                    return;
+                }
+                ackManager.acknowledge(userId, msgId, sessionId);
+                return;
+            }
+        } catch (Exception e) {
+            log.warn("[WS] 无法解析上行消息, payload={}", payload, e);
+            return;
+        }
         log.debug("[WS] 收到消息: {}", payload);
     }
 

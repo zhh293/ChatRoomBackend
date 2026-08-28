@@ -15,6 +15,7 @@ import com.example.chatroom.module.message.mapper.LocalMsgOutboxMapper;
 import com.example.chatroom.module.message.mapper.MsgDeadLetterMapper;
 import com.example.chatroom.module.session.mapper.SessionMapper;
 import com.example.chatroom.module.websocket.manager.WebSocketSessionManager;
+import com.example.chatroom.module.websocket.service.WsPushService;
 import com.example.chatroom.mq.dto.ChatMessageMQDTO;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -66,6 +67,7 @@ public class ChatMessageConsumer {
     private final SessionCacheService sessionCacheService;
     private final MessageCacheService messageCacheService;
     private final WebSocketSessionManager wsSessionManager;
+    private final WsPushService wsPushService;
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
 
@@ -213,7 +215,13 @@ public class ChatMessageConsumer {
 
         String messageJson;
         try {
-            messageJson = objectMapper.writeValueAsString(dto);
+            JsonNode data = objectMapper.valueToTree(dto);
+            com.fasterxml.jackson.databind.node.ObjectNode envelope = objectMapper.createObjectNode();
+            envelope.put("type", "MESSAGE");
+            envelope.put("msgId", dto.getMsgId());
+            envelope.put("sessionId", dto.getSessionId());
+            envelope.set("data", data);
+            messageJson = objectMapper.writeValueAsString(envelope);
         } catch (Exception e) {
             log.error("[MQ Consumer] 序列化推送消息失败, msgId={}", dto.getMsgId(), e);
             return;
@@ -223,29 +231,8 @@ public class ChatMessageConsumer {
             // 跳过发送者自己（发送端已通过 sending 状态感知）
             if (memberId.equals(dto.getSenderId())) continue;
 
-            // 先查本机是否在线
-            if (wsSessionManager.isLocalOnline(memberId)) {
-                wsSessionManager.pushToLocal(memberId, messageJson);
-            } else {
-                // 查 Redis ws:online:{userId} 是否在其他节点在线
-                String onlineKey = RedisKeyConst.WS_ONLINE + memberId;
-                java.util.Map<Object, Object> onlineNodes =
-                        stringRedisTemplate.opsForHash().entries(onlineKey);
-
-                if (!onlineNodes.isEmpty()) {
-                    // 在其他节点在线：通过 Pub/Sub 定向推送
-                    for (Object nodeId : onlineNodes.keySet()) {
-                        if (MACHINE_ID.equals(nodeId.toString())) continue; // 本机已处理
-                        String pushChannel = RedisKeyConst.WS_PUSH_CHANNEL_PREFIX + nodeId;
-                        String pushPayload = buildPushPayload(memberId, messageJson);
-                        stringRedisTemplate.convertAndSend(pushChannel, pushPayload);
-                    }
-                } else {
-                    // 完全离线：消息已写入 ZSet 缓冲区（msg:buf:{sessionId}），
-                    // 前端上线后携带 last_read_msg_id 调用 listMessages 即可拉取离线期间的消息，
-                    // 无需额外暂存到 List。
-                }
-            }
+            wsPushService.pushMessageToUser(
+                    memberId, dto.getMsgId(), dto.getSessionId(), messageJson);
         }
     }
 

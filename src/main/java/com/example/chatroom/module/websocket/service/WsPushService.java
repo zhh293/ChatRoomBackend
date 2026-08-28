@@ -2,8 +2,8 @@ package com.example.chatroom.module.websocket.service;
 
 import com.example.chatroom.cache.session.SessionCacheService;
 import com.example.chatroom.common.constant.RedisKeyConst;
-import com.example.chatroom.module.websocket.manager.WebSocketSessionManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -29,7 +29,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 public class WsPushService {
 
     private final SessionCacheService sessionCacheService;
-    private final WebSocketSessionManager wsSessionManager;
+    private final WebSocketAckManager ackManager;
     private final StringRedisTemplate stringRedisTemplate;
     private final ObjectMapper objectMapper;
     private final ThreadPoolExecutor msgPersistExecutor;
@@ -76,8 +76,8 @@ public class WsPushService {
      */
     public void pushToUser(Long userId, String json) {
         // 先查本机
-        if (wsSessionManager.isLocalOnline(userId)) {
-            wsSessionManager.pushToLocal(userId, json);
+        if (ackManager.isLocalOnline(userId)) {
+            ackManager.pushBestEffortToLocal(userId, json);
             return;
         }
 
@@ -96,7 +96,48 @@ public class WsPushService {
         // 完全离线：不做额外处理，前端下次拉取时自然从DB获取最新状态
     }
 
+    /**
+     * 推送需要客户端 ACK 的聊天消息。
+     * 待确认记录由持有客户端连接的目标节点创建，避免跨节点 ACK 路由。
+     */
+    public void pushMessageToUser(Long userId, Long msgId, Long sessionId, String json) {
+        if (ackManager.isLocalOnline(userId)) {
+            ackManager.pushWithAck(userId, msgId, sessionId, json);
+            return;
+        }
+
+        String onlineKey = RedisKeyConst.WS_ONLINE + userId;
+        Map<Object, Object> onlineNodes = stringRedisTemplate.opsForHash().entries(onlineKey);
+        for (Object nodeId : onlineNodes.keySet()) {
+            if (MACHINE_ID.equals(nodeId.toString())) continue;
+            String pushChannel = RedisKeyConst.WS_PUSH_CHANNEL_PREFIX + nodeId;
+            String pushPayload = buildAckPushPayload(userId, msgId, sessionId, json);
+            stringRedisTemplate.convertAndSend(pushChannel, pushPayload);
+        }
+    }
+
     private String buildPushPayload(Long userId, String message) {
-        return String.format("{\"userId\":%d,\"message\":%s}", userId, message);
+        try {
+            ObjectNode root = objectMapper.createObjectNode();
+            root.put("userId", userId);
+            root.set("message", objectMapper.readTree(message));
+            return objectMapper.writeValueAsString(root);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("无法构造跨节点推送消息", e);
+        }
+    }
+
+    private String buildAckPushPayload(Long userId, Long msgId, Long sessionId, String message) {
+        try {
+            ObjectNode root = objectMapper.createObjectNode();
+            root.put("userId", userId);
+            root.put("requireAck", true);
+            root.put("msgId", msgId);
+            root.put("sessionId", sessionId);
+            root.set("message", objectMapper.readTree(message));
+            return objectMapper.writeValueAsString(root);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("无法构造跨节点 ACK 推送消息", e);
+        }
     }
 }

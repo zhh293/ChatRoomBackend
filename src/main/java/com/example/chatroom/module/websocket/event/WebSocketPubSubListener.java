@@ -1,6 +1,6 @@
 package com.example.chatroom.module.websocket.event;
 
-import com.example.chatroom.module.websocket.manager.WebSocketSessionManager;
+import com.example.chatroom.module.websocket.service.WebSocketAckManager;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -24,7 +24,7 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class WebSocketPubSubListener implements MessageListener {
 
-    private final WebSocketSessionManager sessionManager;
+    private final WebSocketAckManager ackManager;
     private final ObjectMapper objectMapper;
 
     private static final String MACHINE_ID = System.getenv().getOrDefault("MACHINE_ID", "node-1");
@@ -51,9 +51,16 @@ public class WebSocketPubSubListener implements MessageListener {
             Long userId = root.get("userId").asLong();
             String messageJson = root.get("message").toString();
 
-            boolean pushed = sessionManager.pushToLocal(userId, messageJson);
+            boolean pushed;
+            if (root.path("requireAck").asBoolean(false)) {
+                Long msgId = root.get("msgId").asLong();
+                Long sessionId = root.get("sessionId").asLong();
+                pushed = ackManager.pushWithAck(userId, msgId, sessionId, messageJson);
+            } else {
+                pushed = ackManager.pushBestEffortToLocal(userId, messageJson);
+            }
             if (!pushed) {
-                // 用户已在推送过程中断开，忽略即可（离线消息已在消费端写入 Redis List）
+                // 用户已在推送过程中断开，客户端重连后按 lastReceivedMsgId 补拉。
                 log.debug("[WS PubSub] 用户不在本机或连接已断开, userId={}", userId);
             }
         } catch (Exception e) {

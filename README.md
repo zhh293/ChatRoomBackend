@@ -455,9 +455,28 @@ ws://localhost:9090/ws/chat?token=<accessToken>
 Token 在握手阶段校验，成功后连接会绑定 `userId` 并写入 Redis 在线状态。客户端应实现：
 
 - 定期心跳和断线指数退避重连；
-- 重连成功后调用消息列表接口补拉离线消息；
-- 本地保存 `lastReadMsgId`；
+- 重连成功后使用每个会话的 `lastReceivedMsgId` 调用消息列表接口补拉离线消息；
+- 分别维护 `lastReceivedMsgId`（已持久化到客户端）和 `lastReadMsgId`（用户已读位置）；
 - 对收到的消息按 `msgNo` 或 `msgId` 去重。
+
+聊天消息下行格式：
+
+```json
+{
+  "type": "MESSAGE",
+  "msgId": 123,
+  "sessionId": 10,
+  "data": {}
+}
+```
+
+客户端按 `msgId` 幂等保存成功后，通过同一 WebSocket 连接返回：
+
+```json
+{"type":"MESSAGE_ACK","msgId":123,"sessionId":10}
+```
+
+服务端在未收到 ACK 时执行最多 3 次重发，采用指数退避与 Equal Jitter 抖动；达到上限、连接断开或应用重启后停止实时重试，由客户端使用 `lastReceivedMsgId` 和 `direction=after` 补拉。客户端即使收到重复消息，也应再次返回 ACK。`MESSAGE_ACK` 只表示客户端已保存消息，不等同于已读回执，不能推进 `lastReadMsgId`。
 
 Spring WebSocket 支持文本心跳：
 
@@ -471,7 +490,7 @@ Spring WebSocket 支持文本心跳：
 {"type":"PONG"}
 ```
 
-Netty 使用 WebSocket Ping/Pong 帧处理心跳。当前业务消息仍通过 HTTP 上行，WebSocket 主要承担服务端下行推送；Netty 文本业务帧路由尚未实现。
+Netty 使用 WebSocket Ping/Pong 帧处理心跳。当前业务消息仍通过 HTTP 上行，WebSocket 主要承担服务端下行推送；Netty 文本上行当前支持 `MESSAGE_ACK`，其他业务帧路由尚未实现。
 
 ## 部署方案
 

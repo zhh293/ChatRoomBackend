@@ -25,6 +25,12 @@ chat:
     revoke-timeout: 120          # 撤回超时（秒）
   websocket:
     heartbeat-timeout: 60        # 心跳超时（秒）
+    ack:
+      max-retries: 3             # 未收到客户端 ACK 时最多重发次数
+      base-delay-ms: 2000        # 指数退避基础延迟
+      max-delay-ms: 10000        # 单次重试最大延迟
+      max-pending-per-user: 200  # 单用户最大待 ACK 消息数
+      max-pending-total: 10000   # 单节点最大待 ACK 消息数
   group:
     write-fanout-threshold: 1000 # 写扩散阈值：成员数 < 此值用写扩散，否则读扩散
     max-member-count: 2000       # 群聊人数上限，建群和拉人时校验

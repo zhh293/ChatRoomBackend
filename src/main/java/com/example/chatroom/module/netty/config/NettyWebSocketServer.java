@@ -5,6 +5,8 @@ import com.example.chatroom.module.netty.handler.HeartbeatHandler;
 import com.example.chatroom.module.netty.handler.TokenAuthHandler;
 import com.example.chatroom.module.netty.handler.WebSocketFrameHandler;
 import com.example.chatroom.module.netty.manager.NettyChannelManager;
+import com.example.chatroom.module.websocket.service.WebSocketAckManager;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -58,6 +60,8 @@ public class NettyWebSocketServer {
     private final JwtUtil jwtUtil;
     private final NettyChannelManager channelManager;
     private final RedisTemplate<String, Object> redisTemplate;
+    private final ObjectMapper objectMapper;
+    private final WebSocketAckManager ackManager;
 
     private NioEventLoopGroup bossGroup;
     private NioEventLoopGroup workerGroup;
@@ -70,7 +74,7 @@ public class NettyWebSocketServer {
     @PostConstruct
     public void start() {
         heartbeatHandler = new HeartbeatHandler(channelManager, redisTemplate);
-        frameHandler = new WebSocketFrameHandler(channelManager);
+        frameHandler = new WebSocketFrameHandler(channelManager, objectMapper, ackManager);
 
         bossGroup = new NioEventLoopGroup(props.getBossThreads());
         workerGroup = new NioEventLoopGroup(props.getWorkerThreads());
