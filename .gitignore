@@ -1,0 +1,19 @@
+# Build output
+target/
+
+# Local deployment secrets and certificates
+deploy/**/.env
+deploy/production/certs/*
+!deploy/production/certs/README.md
+
+# Runtime data
+data/
+logs/
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

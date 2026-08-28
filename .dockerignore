@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.vscode
+.claude
+.agents
+.codex
+target
+deploy/**/.env
+deploy/production/certs/*
+!deploy/production/certs/README.md
+*.iml
+*.log
+.DS_Store

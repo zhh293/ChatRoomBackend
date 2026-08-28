@@ -1,0 +1,82 @@
+name: ${COMPOSE_PROJECT_NAME:-chatroom-production}
+
+services:
+  app:
+    image: ${CHATROOM_IMAGE:?set CHATROOM_IMAGE in .env}
+    restart: always
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-prod}
+      MACHINE_ID: ${MACHINE_ID:?set a unique MACHINE_ID in .env}
+      XXL_JOB_EXECUTOR_LOGPATH: /data/applogs/xxl-job
+      UPLOAD_TMP_DIR: /data/chatroom-upload
+    expose:
+      - "8080"
+      - "9090"
+      - "9999"
+    volumes:
+      - app-runtime:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "bash", "-c", ": >/dev/tcp/127.0.0.1/8080"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1536M
+        reservations:
+          cpus: "0.5"
+          memory: 768M
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+    networks: [backend]
+
+  gateway:
+    image: nginx:1.29-alpine
+    restart: always
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+    networks: [backend]
+
+volumes:
+  app-runtime:
+
+networks:
+  backend:
+    driver: bridge

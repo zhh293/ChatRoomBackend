@@ -34,11 +34,10 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
-import java.util.concurrent.ThreadPoolExecutor;
 
 /**
  * 聊天消息 RabbitMQ 消费者
- * 手动 ACK + 自定义线程池异步落库
+ * 手动 ACK，同步完成业务处理后再确认消息
  *
  * <h3>消费流程</h3>
  * <pre>
@@ -57,7 +56,6 @@ import java.util.concurrent.ThreadPoolExecutor;
 @EnableAspectJAutoProxy(exposeProxy = true)
 public class ChatMessageConsumer {
 
-    private final ThreadPoolExecutor msgPersistExecutor;
     private final ChatMessageMapper chatMessageMapper;
     private final LocalMsgOutboxMapper outboxMapper;
     private final MsgDeadLetterMapper deadLetterMapper;
@@ -79,14 +77,12 @@ public class ChatMessageConsumer {
         String body = new String(message.getBody());
         String msgNo = message.getMessageProperties().getCorrelationId();
 
-        try {
-            // 提交到自定义线程池异步处理，避免阻塞 RabbitMQ 消费线程
-            msgPersistExecutor.submit(() -> processWithRetry(body, msgNo));
-            // 提交任务成功即 ACK，落库失败由 outbox 补偿任务兜底
+        // 必须等业务处理完成后再 ACK。并发由 RabbitListener 容器负责，
+        // 不能把任务转交给线程池后提前释放 RabbitMQ 中的消息。
+        if (processWithRetry(body, msgNo)) {
             channel.basicAck(deliveryTag, false);
-        } catch (Exception e) {
-            log.error("[MQ Consumer] 提交任务失败, msgNo={}", msgNo, e);
-            // NACK 不重新入队，进死信队列
+        } else {
+            // 已完成本地失败兜底，同时将原始消息送入 RabbitMQ 死信队列。
             channel.basicNack(deliveryTag, false, false);
         }
     }
@@ -95,13 +91,13 @@ public class ChatMessageConsumer {
     // 重试包装
     // =========================================================================
 
-    private void processWithRetry(String payload, String msgNo) {
+    private boolean processWithRetry(String payload, String msgNo) {
         int attempt = 0;
         Exception lastException = null;
         while (attempt < MAX_RETRY) {
             try {
                 processMessage(payload, msgNo);
-                return; // 成功，退出
+                return true;
             } catch (Exception e) {
                 lastException = e;
                 attempt++;
@@ -121,6 +117,7 @@ public class ChatMessageConsumer {
         // 3次全部失败：①清缓存 ②写死信表 ③更新outbox状态 ④通知发送者
         log.error("[MQ Consumer] 消息处理彻底失败, msgNo={}", msgNo, lastException);
         handleFinalFailure(payload, lastException);
+        return false;
     }
 
     // =========================================================================
