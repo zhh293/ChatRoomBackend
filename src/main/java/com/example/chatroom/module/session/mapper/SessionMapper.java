@@ -97,6 +97,21 @@ public interface SessionMapper extends BaseMapper<Session> {
                       @Param("lastMsgAt") java.time.LocalDateTime lastMsgAt);
 
     /**
+     * 撤回消息时更新会话最后一条消息摘要（仅当被撤回的消息恰好是 last_msg_id 时才更新）
+     * 不改变 last_msg_id 和 last_msg_at，只改摘要内容
+     */
+    @Update("""
+            UPDATE session
+            SET last_msg_content = #{lastMsgContent},
+                updated_at       = NOW()
+            WHERE id = #{sessionId}
+              AND last_msg_id = #{msgId}
+            """)
+    int updateLastMsgContentIfMatch(@Param("sessionId") Long sessionId,
+                                    @Param("msgId") Long msgId,
+                                    @Param("lastMsgContent") String lastMsgContent);
+
+    /**
      * 带人数上限的 member_count 更新（乐观兜底）
      *
      * <p>只有在 member_count + delta <= maxCount 时才执行更新，

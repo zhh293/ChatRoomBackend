@@ -4,6 +4,7 @@ import com.example.chatroom.cache.message.MessageCacheService;
 import com.example.chatroom.cache.session.SessionCacheService;
 import com.example.chatroom.common.config.RabbitMQConfig;
 import com.example.chatroom.common.constant.RedisKeyConst;
+import com.example.chatroom.common.delay.DelayQueueService;
 import com.example.chatroom.module.call.domain.entity.CallRecord;
 import com.example.chatroom.module.call.domain.enums.CallStatus;
 import com.example.chatroom.module.call.mapper.CallRecordMapper;
@@ -60,6 +61,7 @@ public class ChatMessageConsumer {
     private final ChatMessageMapper chatMessageMapper;
     private final LocalMsgOutboxMapper outboxMapper;
     private final MsgDeadLetterMapper deadLetterMapper;
+    private final DelayQueueService delayQueueService;
     private final SessionMapper sessionMapper;
     private final CallRecordMapper callRecordMapper;
     private final SessionCacheService sessionCacheService;
@@ -147,6 +149,9 @@ public class ChatMessageConsumer {
         // ② 通过代理对象调用，确保 @Transactional 生效
         ChatMessageConsumer proxy = (ChatMessageConsumer) AopContext.currentProxy();
         proxy.persistInTransaction(dto);
+
+        // ②.5 落库成功，主动移除延迟队列中的任务（避免到期空跑）
+        delayQueueService.removeTask(dto.getMsgNo());
 
         // ③ 失效 session info 缓存（非事务操作，DB 已提交后再做）
         sessionCacheService.evict(dto.getSessionId());

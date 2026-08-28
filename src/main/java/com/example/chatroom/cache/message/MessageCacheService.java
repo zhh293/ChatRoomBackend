@@ -366,37 +366,84 @@ public class MessageCacheService {
     }
 
     /**
-     * 撤回消息：Pipeline 合并删除热消息 ZSet + 历史消息 ZSet，一次网络往返
+     * Lua 脚本：原子更新 ZSet 中指定 score 的消息 status 字段
+     *
+     * <p>使用 Redis 内置 cjson 库解析 JSON，修改 status 字段后重新序列化写回。
+     * 不依赖 JSON 字段顺序或格式，彻底避免字符串替换的脆弱性。
+     *
+     * <p>逻辑：
+     * <ol>
+     *   <li>ZRANGEBYSCORE 按 score（msgId）精确找到那条消息 JSON</li>
+     *   <li>cjson.decode 解析为 table，修改 status 字段为目标值</li>
+     *   <li>cjson.encode 序列化回 JSON</li>
+     *   <li>ZREM 旧值 + ZADD 新值（score 不变），保证原子性</li>
+     * </ol>
+     *
+     * KEYS[1] = zsetKey
+     * ARGV[1] = score（msgId，double）
+     * ARGV[2] = 目标 status 值（如 "2" 表示撤回）
+     * 返回：1 = 更新成功，0 = 未找到该消息或 status 已是目标值
+     */
+    private static final RedisScript<Long> REVOKE_STATUS_SCRIPT = new DefaultRedisScript<>(
+            "local items = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[1], ARGV[1]) " +
+            "if #items == 0 then return 0 end " +
+            "local old = items[1] " +
+            "local obj = cjson.decode(old) " +
+            "if obj.status == tonumber(ARGV[2]) then return 0 end " +
+            "obj.status = tonumber(ARGV[2]) " +
+            "local new = cjson.encode(obj) " +
+            "redis.call('ZREM', KEYS[1], old) " +
+            "redis.call('ZADD', KEYS[1], ARGV[1], new) " +
+            "return 1",
+            Long.class
+    );
+
+    /**
+     * 撤回消息：Lua 脚本原子更新 ZSet 中消息的 status=2
      *
      * <p>热消息 ZSet 可能有多个 key（大群分片），历史消息 ZSet 固定一个 key，
-     * 全部打包进同一个 Pipeline 批量执行，减少 RTT。
+     * Pipeline 批量执行所有 key 的 Lua 脚本，一次网络往返。
+     *
+     * <p>相比直接删除的优势：
+     * <ul>
+     *   <li>前端从缓存拿到 status=2，直接渲染"已撤回"，不会出现消息凭空消失</li>
+     *   <li>缓存与 DB 状态语义一致</li>
+     * </ul>
      *
      * @param sessionId   会话 ID
      * @param msgId       被撤回的消息 ID
-     * @param memberCount 群人数（用于路由热消息 ZSet 分片），null 时保守删全部
+     * @param memberCount 群人数（用于路由热消息 ZSet 分片），null 时保守处理全部
      */
     public void revokeMessageCache(Long sessionId, Long msgId, Integer memberCount) {
         List<String> hotKeys = resolveWriteKeys(sessionId, memberCount);
         String historyKey = RedisKeyConst.MSG_HISTORY + sessionId;
-        double score = (double) msgId;
+        String scoreStr = String.valueOf(msgId);
+        String targetStatus = "2"; // 撤回状态
 
         try {
+            // Pipeline 批量执行：每个 key 一次 Lua 脚本调用
             stringRedisTemplate.executePipelined((org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
-                // 删热消息 ZSet（小群 1 个 key，大群 4 个分片 key）
+                byte[] scriptBytes = ((DefaultRedisScript<Long>) REVOKE_STATUS_SCRIPT).getScriptAsString().getBytes();
+
+                // 热消息 ZSet（小群 1 个 key，大群 4 个分片 key）
                 for (String key : hotKeys) {
-                    connection.zSetCommands().zRemRangeByScore(
-                            key.getBytes(),
-                            org.springframework.data.domain.Range.closed(score, score));
+                    connection.scriptingCommands().eval(
+                            scriptBytes,
+                            org.springframework.data.redis.connection.ReturnType.INTEGER,
+                            1,
+                            key.getBytes(), scoreStr.getBytes(), targetStatus.getBytes());
                 }
-                // 删历史消息 ZSet
-                connection.zSetCommands().zRemRangeByScore(
-                        historyKey.getBytes(),
-                        org.springframework.data.domain.Range.closed(score, score));
+                // 历史消息 ZSet
+                connection.scriptingCommands().eval(
+                        scriptBytes,
+                        org.springframework.data.redis.connection.ReturnType.INTEGER,
+                        1,
+                        historyKey.getBytes(), scoreStr.getBytes(), targetStatus.getBytes());
                 return null;
             });
-            log.debug("[MessageCache] Pipeline 撤回缓存, sessionId={}, msgId={}", sessionId, msgId);
+            log.debug("[MessageCache] Pipeline+Lua 撤回缓存 status→2, sessionId={}, msgId={}", sessionId, msgId);
         } catch (Exception e) {
-            log.warn("[MessageCache] Pipeline 撤回缓存失败, sessionId={}, msgId={}", sessionId, msgId, e);
+            log.warn("[MessageCache] Pipeline+Lua 撤回缓存失败, sessionId={}, msgId={}", sessionId, msgId, e);
         }
     }
 

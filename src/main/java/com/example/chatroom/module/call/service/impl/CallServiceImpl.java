@@ -4,6 +4,7 @@ import com.example.chatroom.cache.bloom.BloomFilterInitializer;
 import com.example.chatroom.cache.message.MessageCacheService;
 import com.example.chatroom.cache.session.SessionCacheService;
 import com.example.chatroom.common.constant.RedisKeyConst;
+import com.example.chatroom.common.delay.DelayQueueService;
 import com.example.chatroom.common.exception.BizException;
 import com.example.chatroom.common.response.ResultCode;
 import com.example.chatroom.common.util.SnowflakeIdGenerator;
@@ -24,7 +25,6 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -57,6 +57,7 @@ public class CallServiceImpl implements CallService {
     private final SessionCacheService sessionCacheService;
     private final MessageCacheService messageCacheService;
     private final ChatMessageProducer mqProducer;
+    private final DelayQueueService delayQueueService;
     private final SnowflakeIdGenerator idGenerator;
     private final RedissonClient redissonClient;
     private final StringRedisTemplate stringRedisTemplate;
@@ -95,15 +96,14 @@ public class CallServiceImpl implements CallService {
             throw new BizException(ResultCode.CALL_SESSION_NOT_SINGLE);
         }
 
-        // ④ 确定被叫用户
-        List<Long> memberIds = sessionCacheService.getMemberUserIds(dto.getSessionId());
-        if (memberIds == null || memberIds.size() != 2) {
-            throw new BizException(ResultCode.SESSION_NOT_FOUND);
+        // ④ 校验被叫用户（前端传入 calleeId，后端只验证其是否在会话中）
+        Long calleeId = dto.getCalleeId();
+        if (calleeId.equals(callerId)) {
+            throw new BizException(ResultCode.CALL_SESSION_NOT_SINGLE);
         }
-        Long calleeId = memberIds.stream()
-                .filter(id -> !id.equals(callerId))
-                .findFirst()
-                .orElseThrow(() -> new BizException(ResultCode.SESSION_NOT_FOUND));
+        if (!messageCacheService.isMember(dto.getSessionId(), calleeId)) {
+            throw new BizException(ResultCode.ILLEGAL_SESSION);
+        }
 
         // ⑤ 忙线检测：双方都不能在通话中
         String callerBusyKey = CALL_BUSY_PREFIX + callerId;
@@ -175,6 +175,9 @@ public class CallServiceImpl implements CallService {
             // ⑩ 发送到 RabbitMQ
             mqProducer.sendWithConfirm(outbox.getPayload(), dto.getMsgNo());
 
+            // ⑩.5 投递延迟任务：30s 后检查 outbox 是否已落库
+            delayQueueService.addTask(dto.getMsgNo(), 30);
+
         } catch (Exception e) {
             // 失败回滚 ZSet 缓存
             log.error("[Call] 写Outbox或发MQ失败，回滚缓存, msgId={}, msgNo={}",
@@ -210,6 +213,7 @@ public class CallServiceImpl implements CallService {
         mqDTO.setExtra(buildExtra(callId, calleeId));
         mqDTO.setTimestamp(System.currentTimeMillis());
         mqDTO.setMemberCount(session.getMemberCount());
+        mqDTO.setStatus(1); // 初始状态=正常
         return mqDTO;
     }
 

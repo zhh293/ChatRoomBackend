@@ -7,6 +7,7 @@ import com.example.chatroom.common.exception.BizException;
 import com.example.chatroom.common.response.PageResult;
 import com.example.chatroom.common.response.ResultCode;
 import com.example.chatroom.common.util.SnowflakeIdGenerator;
+import com.example.chatroom.module.message.domain.dto.UnreadCountParam;
 import com.example.chatroom.module.message.mapper.ChatMessageMapper;
 import com.example.chatroom.module.session.domain.dto.CreateGroupSessionDTO;
 import com.example.chatroom.module.session.domain.dto.CreateSingleSessionDTO;
@@ -342,46 +343,82 @@ public class SessionServiceImpl implements SessionService {
      * 2. lastMsgContent / lastMsgAt
      *    - ZSet 非空 → 取 score 最大的那条
      *    - ZSet 为空 → 回源 DB 取最新一条
+     *
+     * <h3>Pipeline 优化</h3>
+     * 使用 Pipeline 一次网络往返批量执行所有会话的 ZRANGEBYSCORE（取 min）+ ZREVRANGEBYSCORE（取 max）+
+     * ZCOUNT（未读数）命令，避免 N 个会话 × 3 次 RTT 的 N+1 问题。
+     * Pipeline 执行完毕后，对缓存缺失的会话再批量回源 DB。
      */
     private void fillUnreadAndLastMsg(Long userId, List<SessionVO> list) {
         if (list == null || list.isEmpty()) return;
 
-        for (SessionVO vo : list) {
-            Long sessionId   = vo.getSessionId();
-            Long lastReadId  = vo.getLastReadMsgId() != null ? vo.getLastReadMsgId() : 0L;
-            int  memberCount = vo.getMemberCount() != null ? vo.getMemberCount() : 0;
+        int n = list.size();
 
-            String zsetKey = resolveZSetKey(sessionId, memberCount, userId);
+        // 1. 预计算每个会话的 ZSet key 和 lastReadId
+        String[] zsetKeys = new String[n];
+        long[] lastReadIds = new long[n];
+        for (int i = 0; i < n; i++) {
+            SessionVO vo = list.get(i);
+            int memberCount = vo.getMemberCount() != null ? vo.getMemberCount() : 0;
+            zsetKeys[i] = resolveZSetKey(vo.getSessionId(), memberCount, userId);
+            lastReadIds[i] = vo.getLastReadMsgId() != null ? vo.getLastReadMsgId() : 0L;
+        }
 
-            // --- 取 ZSet 最小 score（最老消息的 msgId）和最大 score（最新消息）---
-            // rangeWithScores(key, 0, 0) = 最小 score 那条
+        // 2. Pipeline 批量执行：每个会话 3 个命令（ZRANGE min + ZREVRANGE max + ZCOUNT）
+        //    命令顺序：[key0_min, key0_max, key0_count, key1_min, key1_max, key1_count, ...]
+        List<Object> pipelineResults = redisTemplate.executePipelined(
+                (org.springframework.data.redis.core.RedisCallback<Object>) connection -> {
+                    for (int i = 0; i < n; i++) {
+                        byte[] keyBytes = zsetKeys[i].getBytes();
+                        // ZRANGEBYSCORE key -inf +inf LIMIT 0 1 → 取最小 score 那条（带 score）
+                        connection.zRangeByScoreWithScores(keyBytes, Double.NEGATIVE_INFINITY,
+                                Double.POSITIVE_INFINITY, 0, 1);
+                        // ZREVRANGEBYSCORE key +inf -inf LIMIT 0 1 → 取最大 score 那条（带 score）
+                        connection.zRevRangeByScoreWithScores(keyBytes, Double.NEGATIVE_INFINITY,
+                                Double.POSITIVE_INFINITY, 0, 1);
+                        // ZCOUNT key (lastReadId +inf → 未读数
+                        connection.zCount(keyBytes, lastReadIds[i] + 1, Double.POSITIVE_INFINITY);
+                    }
+                    return null;
+                });
+
+        // 3. 解析 Pipeline 结果，填充 VO
+        //    需要回源 DB 的会话索引收集起来，后面批量处理
+        List<Integer> dbFallbackForUnread = new ArrayList<>();
+        List<Integer> dbFallbackForLastMsg = new ArrayList<>();
+
+        for (int i = 0; i < n; i++) {
+            SessionVO vo = list.get(i);
+            int baseIdx = i * 3;
+
+            // 解析 min（ZRANGEBYSCORE 结果）
+            @SuppressWarnings("unchecked")
             Set<ZSetOperations.TypedTuple<String>> minSet =
-                    redisTemplate.opsForZSet().rangeWithScores(zsetKey, 0, 0);
+                    (Set<ZSetOperations.TypedTuple<String>>) pipelineResults.get(baseIdx);
+            // 解析 max（ZREVRANGEBYSCORE 结果）
+            @SuppressWarnings("unchecked")
             Set<ZSetOperations.TypedTuple<String>> maxSet =
-                    redisTemplate.opsForZSet().reverseRangeWithScores(zsetKey, 0, 0);
+                    (Set<ZSetOperations.TypedTuple<String>>) pipelineResults.get(baseIdx + 1);
+            // 解析 ZCOUNT 结果
+            Long zcount = (Long) pipelineResults.get(baseIdx + 2);
 
             boolean zsetExists = minSet != null && !minSet.isEmpty();
 
             // --- 未读数 ---
             if (!zsetExists) {
-                // ZSet 不存在或为空，回源 DB
-                vo.setUnreadCount(chatMessageMapper.countUnread(sessionId, lastReadId));
+                dbFallbackForUnread.add(i);
             } else {
                 long minScore = minSet.iterator().next().getScore().longValue();
-                if (lastReadId < minScore) {
-                    // lastReadMsgId 比 ZSet 最小 score 还小，ZSet 数据不完整，回源 DB
-                    vo.setUnreadCount(chatMessageMapper.countUnread(sessionId, lastReadId));
+                if (lastReadIds[i] < minScore) {
+                    // lastReadMsgId 比 ZSet 最小 score 还小，ZSet 数据不完整
+                    dbFallbackForUnread.add(i);
                 } else {
-                    // ZSet 数据完整，直接 ZCOUNT
-                    Long zcount = redisTemplate.opsForZSet().count(
-                            zsetKey, (double) lastReadId + 1, Double.MAX_VALUE);
                     vo.setUnreadCount(zcount != null ? zcount.intValue() : 0);
                 }
             }
 
             // --- 最后一条消息 ---
             if (zsetExists && maxSet != null && !maxSet.isEmpty()) {
-                // ZSet 非空，取 score 最大（最新）的那条
                 String msgJson = maxSet.iterator().next().getValue();
                 if (msgJson != null) {
                     try {
@@ -396,16 +433,44 @@ public class SessionServiceImpl implements SessionService {
                             vo.setLastMsgAt(objectMapper.convertValue(createdAt, LocalDateTime.class));
                         }
                     } catch (Exception e) {
-                        log.warn("[SessionList] 解析 ZSet 消息 JSON 失败, sessionId={}", sessionId, e);
+                        log.warn("[SessionList] Pipeline 解析 ZSet 消息 JSON 失败, sessionId={}",
+                                vo.getSessionId(), e);
                     }
                 }
             } else {
-                // ZSet 为空，回源 DB 取最新一条
-                var latest = chatMessageMapper.selectLatest(sessionId, 1);
-                if (!latest.isEmpty()) {
-                    vo.setLastMsgContent(latest.get(0).getContent());
-                    vo.setLastMsgAt(latest.get(0).getCreatedAt());
-                }
+                dbFallbackForLastMsg.add(i);
+            }
+        }
+
+        // 4. 批量回源 DB：未读数（UNION ALL 一次往返）
+        if (!dbFallbackForUnread.isEmpty()) {
+            List<UnreadCountParam> params = dbFallbackForUnread.stream()
+                    .map(idx -> new UnreadCountParam(list.get(idx).getSessionId(), lastReadIds[idx]))
+                    .collect(Collectors.toList());
+            List<Map<String, Object>> batchResults = chatMessageMapper.batchCountUnread(params);
+
+            // 构建 sessionId → unreadCount 映射
+            Map<Long, Integer> unreadMap = new HashMap<>(batchResults.size());
+            for (Map<String, Object> row : batchResults) {
+                Long sid = ((Number) row.get("session_id")).longValue();
+                int count = ((Number) row.get("unread_count")).intValue();
+                unreadMap.put(sid, count);
+            }
+
+            // 回填到 VO
+            for (int idx : dbFallbackForUnread) {
+                SessionVO vo = list.get(idx);
+                vo.setUnreadCount(unreadMap.getOrDefault(vo.getSessionId(), 0));
+            }
+        }
+
+        // 5. 批量回源 DB：最后一条消息
+        for (int idx : dbFallbackForLastMsg) {
+            SessionVO vo = list.get(idx);
+            var latest = chatMessageMapper.selectLatest(vo.getSessionId(), 1);
+            if (!latest.isEmpty()) {
+                vo.setLastMsgContent(latest.get(0).getContent());
+                vo.setLastMsgAt(latest.get(0).getCreatedAt());
             }
         }
     }
