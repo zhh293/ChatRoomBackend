@@ -215,9 +215,11 @@ public class MessageServiceImpl implements MessageService {
             } else {
                 List<ChatMessage> dbList = cursor == null
                         ? chatMessageMapper.selectLatest(sessionId, safeSize)
-                        : chatMessageMapper.selectBefore(sessionId, cursor, safeSize);
+                        : chatMessageMapper.selectAfter(sessionId, cursor, safeSize);
                 voList = dbList.stream().map(this::toVO).collect(Collectors.toList());
-                Collections.reverse(voList);
+                if (cursor == null) {
+                    Collections.reverse(voList);
+                }
                 hasMore = dbList.size() == safeSize;
                 nextCursor = voList.isEmpty() ? null : voList.get(voList.size() - 1).getMsgId();
             }
