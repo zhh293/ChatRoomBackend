@@ -2,6 +2,7 @@ package com.example.chatroom.module.websocket.manager;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
@@ -31,9 +32,12 @@ public class WebSocketSessionManager {
     /**
      * 移除连接
      */
-    public void remove(Long userId) {
-        localSessions.remove(userId);
-        log.info("[WS Manager] 用户下线, userId={}", userId);
+    public boolean remove(Long userId, WebSocketSession session) {
+        boolean removed = localSessions.remove(userId, session);
+        if (removed) {
+            log.info("[WS Manager] 用户下线, userId={}", userId);
+        }
+        return removed;
     }
 
     /**
@@ -59,6 +63,23 @@ public class WebSocketSessionManager {
             return true;
         } catch (IOException e) {
             log.error("[WS Manager] 推送消息失败, userId={}", userId, e);
+            return false;
+        }
+    }
+
+    /**
+     * ACK 重试耗尽后主动关闭连接，促使客户端重连并补拉消息。
+     */
+    public boolean closeForResync(Long userId) {
+        WebSocketSession session = localSessions.get(userId);
+        if (session == null || !session.isOpen()) {
+            return false;
+        }
+        try {
+            session.close(new CloseStatus(1011, "MESSAGE_ACK_TIMEOUT"));
+            return true;
+        } catch (IOException e) {
+            log.warn("[WS Manager] 关闭待补拉连接失败, userId={}", userId, e);
             return false;
         }
     }

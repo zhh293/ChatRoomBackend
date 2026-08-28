@@ -1,10 +1,12 @@
 package com.example.chatroom.module.netty.manager;
 
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelId;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
+import io.netty.handler.codec.http.websocketx.CloseWebSocketFrame;
 import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.GlobalEventExecutor;
 import lombok.extern.slf4j.Slf4j;
@@ -147,6 +149,25 @@ public class NettyChannelManager {
             if (ch != null && ch.isActive()) {
                 // writeAndFlush 是线程安全的，Netty 内部会将任务提交到 Channel 绑定的 EventLoop
                 ch.writeAndFlush(new TextWebSocketFrame(json));
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * ACK 重试耗尽后关闭该用户在本机的全部连接，促使客户端重连补拉。
+     */
+    public int closeUserConnectionsForResync(Long userId) {
+        CopyOnWriteArraySet<ChannelId> ids = userChannels.get(userId);
+        if (ids == null || ids.isEmpty()) return 0;
+
+        int count = 0;
+        for (ChannelId id : ids) {
+            Channel ch = channelMap.get(id);
+            if (ch != null && ch.isActive()) {
+                ch.writeAndFlush(new CloseWebSocketFrame(1011, "MESSAGE_ACK_TIMEOUT"))
+                        .addListener(ChannelFutureListener.CLOSE);
                 count++;
             }
         }

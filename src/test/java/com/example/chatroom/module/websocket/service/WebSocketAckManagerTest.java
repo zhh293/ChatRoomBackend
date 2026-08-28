@@ -3,11 +3,14 @@ package com.example.chatroom.module.websocket.service;
 import com.example.chatroom.module.netty.manager.NettyChannelManager;
 import com.example.chatroom.module.websocket.manager.WebSocketSessionManager;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class WebSocketAckManagerTest {
@@ -26,6 +29,11 @@ class WebSocketAckManagerTest {
         ReflectionTestUtils.setField(ackManager, "maxDelayMillis", 10_000L);
         ReflectionTestUtils.setField(ackManager, "maxPendingPerUser", 200);
         ReflectionTestUtils.setField(ackManager, "maxPendingTotal", 10_000);
+    }
+
+    @AfterEach
+    void tearDown() {
+        ackManager.stop();
     }
 
     @Test
@@ -61,6 +69,22 @@ class WebSocketAckManagerTest {
 
         assertThat(ackManager.acknowledge(userId, msgId, 11L)).isFalse();
         assertThat(ackManager.getPendingCount()).isEqualTo(1);
+    }
+
+    @Test
+    void retryExhaustionShouldCloseConnectionsForResync() {
+        long userId = 1L;
+        when(springSessionManager.pushToLocal(userId, "payload")).thenReturn(true);
+        ReflectionTestUtils.setField(ackManager, "maxRetries", 0);
+        ReflectionTestUtils.setField(ackManager, "baseDelayMillis", 1L);
+        ReflectionTestUtils.setField(ackManager, "maxDelayMillis", 1L);
+
+        ackManager.start();
+        ackManager.pushWithAck(userId, 101L, 10L, "payload");
+
+        verify(springSessionManager, timeout(1_000)).closeForResync(userId);
+        verify(nettyChannelManager, timeout(1_000)).closeUserConnectionsForResync(userId);
+        assertThat(ackManager.getPendingCount()).isZero();
     }
 
     private void assertDelayRange(int retryCount, long lowerBound, long upperBound) {

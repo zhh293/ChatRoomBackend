@@ -111,7 +111,10 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         if (userId == null) return;
 
         // 从本机 Map 移除
-        sessionManager.remove(userId);
+        if (!sessionManager.remove(userId, session)) {
+            // 旧连接的关闭回调不能清理刚建立的新连接及其在线状态。
+            return;
+        }
 
         // 删除 Redis 在线状态
         redisTemplate.opsForHash().delete(WS_ONLINE_KEY_PREFIX + userId, MACHINE_ID);

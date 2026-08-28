@@ -158,8 +158,12 @@ public class WebSocketAckManager {
 
         if (expired.retryCount() >= maxRetries) {
             removePending(expired.key(), expired);
-            log.warn("[WS ACK] 达到最大重试次数，等待客户端补拉, userId={}, msgId={}",
-                    expired.key().userId(), expired.key().msgId());
+            Long userId = expired.key().userId();
+            boolean springClosed = springSessionManager.closeForResync(userId);
+            int nettyClosed = nettyChannelManager.closeUserConnectionsForResync(userId);
+            log.warn("[WS ACK] 达到最大重试次数，已关闭连接等待客户端重连补拉, "
+                            + "userId={}, msgId={}, springClosed={}, nettyClosed={}",
+                    userId, expired.key().msgId(), springClosed, nettyClosed);
             return;
         }
 

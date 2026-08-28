@@ -476,7 +476,7 @@ Token 在握手阶段校验，成功后连接会绑定 `userId` 并写入 Redis 
 {"type":"MESSAGE_ACK","msgId":123,"sessionId":10}
 ```
 
-服务端在未收到 ACK 时执行最多 3 次重发，采用指数退避与 Equal Jitter 抖动；达到上限、连接断开或应用重启后停止实时重试，由客户端使用 `lastReceivedMsgId` 和 `direction=after` 补拉。客户端即使收到重复消息，也应再次返回 ACK。`MESSAGE_ACK` 只表示客户端已保存消息，不等同于已读回执，不能推进 `lastReadMsgId`。
+服务端在未收到 ACK 时执行最多 3 次重发，采用指数退避与 Equal Jitter 抖动；达到上限后服务端会主动关闭连接，客户端必须自动重连，并在每次连接成功后使用 `lastReadMsgId` 和 `direction=after` 分页补拉直至 `hasMore=false`。客户端应按 `msgId` 幂等保存，收到重复消息时仍需返回 ACK。`MESSAGE_ACK` 只表示客户端已保存消息，不等同于已读回执，不能推进 `lastReadMsgId`。
 
 Spring WebSocket 支持文本心跳：
 
