@@ -39,7 +39,7 @@
 | Netty | 独立 WebSocket 端口、连接管理、心跳 | 基础实现，上行业务路由待补齐 |
 | 语音通话 | HTTP 发起、通话记录模型、状态机、WebRTC 方案文档 | 部分实现 |
 | 通知 | 数据模型与接口占位 | 待实现 |
-| 测试 | 单元测试、集成测试、容器化测试 | 待补齐 |
+| 测试 | ACK 单元测试已实现；其余单元、集成和容器化测试 | 待补齐 |
 
 ## 系统架构
 
@@ -476,7 +476,21 @@ Token 在握手阶段校验，成功后连接会绑定 `userId` 并写入 Redis 
 {"type":"MESSAGE_ACK","msgId":123,"sessionId":10}
 ```
 
-服务端在未收到 ACK 时执行最多 3 次重发，采用指数退避与 Equal Jitter 抖动；达到上限后服务端会主动关闭连接，客户端必须自动重连，并在每次连接成功后使用 `lastReadMsgId` 和 `direction=after` 分页补拉直至 `hasMore=false`。客户端应按 `msgId` 幂等保存，收到重复消息时仍需返回 ACK。`MESSAGE_ACK` 只表示客户端已保存消息，不等同于已读回执，不能推进 `lastReadMsgId`。
+客户端也可以将最多 50 条确认合并发送：
+
+```json
+{
+  "type":"MESSAGE_ACK_BATCH",
+  "items":[
+    {"msgId":123,"sessionId":10},
+    {"msgId":124,"sessionId":10}
+  ]
+}
+```
+
+服务端在未收到 ACK 时执行最多 3 次重发，采用指数退避与 Equal Jitter 抖动；达到上限后服务端会主动关闭连接，客户端必须自动重连，并在每次连接成功后使用 `lastReceivedMsgId` 和 `direction=after` 分页补拉直至 `hasMore=false`。客户端应按 `msgId` 幂等保存，收到重复消息时仍需返回 ACK。`MESSAGE_ACK` 只表示客户端已保存消息，不等同于已读回执，不能推进 `lastReadMsgId`。
+
+待确认消息以本地内存为 ACK 快路径，并异步写入 Redis 恢复影子；节点使用相同 `MACHINE_ID` 重启后会限量恢复记录。Redis 操作不阻塞 ACK，恢复失败时仍由数据库消息和客户端游标补拉兜底。完整协议和恢复边界见 [`docs/message-delivery-ack.md`](./docs/message-delivery-ack.md)。
 
 Spring WebSocket 支持文本心跳：
 
@@ -490,7 +504,7 @@ Spring WebSocket 支持文本心跳：
 {"type":"PONG"}
 ```
 
-Netty 使用 WebSocket Ping/Pong 帧处理心跳。当前业务消息仍通过 HTTP 上行，WebSocket 主要承担服务端下行推送；Netty 文本上行当前支持 `MESSAGE_ACK`，其他业务帧路由尚未实现。
+Netty 使用 WebSocket Ping/Pong 帧处理心跳。当前业务消息仍通过 HTTP 上行，WebSocket 主要承担服务端下行推送；Netty 文本上行当前支持 `MESSAGE_ACK` 和 `MESSAGE_ACK_BATCH`，其他业务帧路由尚未实现。
 
 ## 部署方案
 
@@ -565,7 +579,7 @@ Netty 使用 WebSocket Ping/Pong 帧处理心跳。当前业务消息仍通过 H
 4. Spring WebSocket 与 Netty 两套连接管理并存，消息消费者的本机在线判断主要依赖 Spring WebSocket Manager，需要统一。
 5. `LocalOssClient` 只适用于单节点本地磁盘；配置 OSS 环境变量并不会自动把文件上传到云 OSS。
 6. 语音通话只实现发起链路和基础状态模型，CallSignalHandler、TURN 临时凭证、通话记录查询等仍待开发。
-7. 仓库当前没有 `src/test`，缺少自动化回归保障。
+7. 当前仅覆盖 ACK 管理和 Redis 恢复影子的单元测试，整体自动化回归仍需补齐。
 8. 没有数据库迁移框架，`init.sql` 只能解决首次初始化。
 9. 尚未接入 Actuator、Prometheus、Tracing，健康检查只能覆盖端口或网关。
 

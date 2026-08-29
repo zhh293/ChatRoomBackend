@@ -7,8 +7,15 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.util.List;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -18,17 +25,23 @@ class WebSocketAckManagerTest {
     private WebSocketAckManager ackManager;
     private WebSocketSessionManager springSessionManager;
     private NettyChannelManager nettyChannelManager;
+    private WebSocketAckStore ackStore;
 
     @BeforeEach
     void setUp() {
         springSessionManager = mock(WebSocketSessionManager.class);
         nettyChannelManager = mock(NettyChannelManager.class);
-        ackManager = new WebSocketAckManager(springSessionManager, nettyChannelManager);
+        ackStore = mock(WebSocketAckStore.class);
+        when(ackStore.loadForNode(anyString(), anyInt())).thenReturn(List.of());
+        ackManager = new WebSocketAckManager(springSessionManager, nettyChannelManager, ackStore);
 
         ReflectionTestUtils.setField(ackManager, "baseDelayMillis", 2_000L);
         ReflectionTestUtils.setField(ackManager, "maxDelayMillis", 10_000L);
         ReflectionTestUtils.setField(ackManager, "maxPendingPerUser", 200);
         ReflectionTestUtils.setField(ackManager, "maxPendingTotal", 10_000);
+        ReflectionTestUtils.setField(ackManager, "maxBatchSize", 50);
+        ReflectionTestUtils.setField(ackManager, "recoveryBatchSize", 10_000);
+        ReflectionTestUtils.setField(ackManager, "recoveryDelayMillis", 5_000L);
     }
 
     @AfterEach
@@ -57,6 +70,7 @@ class WebSocketAckManagerTest {
         assertThat(ackManager.acknowledge(userId, msgId, sessionId)).isTrue();
         assertThat(ackManager.getPendingCount()).isZero();
         assertThat(ackManager.acknowledge(userId, msgId, sessionId)).isTrue();
+        verify(ackStore, times(2)).remove(anyString(), eq(userId), eq(msgId));
     }
 
     @Test
@@ -69,6 +83,38 @@ class WebSocketAckManagerTest {
 
         assertThat(ackManager.acknowledge(userId, msgId, 11L)).isFalse();
         assertThat(ackManager.getPendingCount()).isEqualTo(1);
+    }
+
+    @Test
+    void batchAckShouldRemovePendingMessagesAndBatchRedisCleanup() {
+        long userId = 1L;
+        when(springSessionManager.pushToLocal(userId, "payload-1")).thenReturn(true);
+        when(springSessionManager.pushToLocal(userId, "payload-2")).thenReturn(true);
+
+        ackManager.pushWithAck(userId, 101L, 10L, "payload-1");
+        ackManager.pushWithAck(userId, 102L, 10L, "payload-2");
+
+        int removed = ackManager.acknowledgeBatch(userId, List.of(
+                new WebSocketAckManager.AckItem(101L, 10L),
+                new WebSocketAckManager.AckItem(102L, 10L)));
+
+        assertThat(removed).isEqualTo(2);
+        assertThat(ackManager.getPendingCount()).isZero();
+        verify(ackStore).removeBatch(anyString(), eq(userId),
+                argThat(ids -> ids.containsAll(List.of(101L, 102L))));
+    }
+
+    @Test
+    void startShouldRecoverPendingMessagesFromRedisShadow() {
+        when(ackStore.loadForNode(anyString(), anyInt())).thenReturn(List.of(
+                new WebSocketAckStore.PendingSnapshot(
+                        1L, 101L, 10L, "payload", 1, System.currentTimeMillis())));
+
+        ackManager.start();
+
+        assertThat(ackManager.getPendingCount()).isEqualTo(1);
+        verify(ackStore).save(anyString(),
+                argThat(snapshot -> snapshot.msgId().equals(101L) && snapshot.retryCount() == 1));
     }
 
     @Test

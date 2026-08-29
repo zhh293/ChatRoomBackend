@@ -34,6 +34,9 @@ public class ThreadPoolConfig {
     @Value("${thread-pool.cache-rebuild.queue-capacity:200}")
     private int cacheRebuildQueueCapacity;
 
+    @Value("${thread-pool.ws-ack-store.queue-capacity:10000}")
+    private int wsAckStoreQueueCapacity;
+
     /**
      * 消息持久化线程池（RabbitMQ 消费者内部异步落库）
      * 拒绝策略：CallerRunsPolicy，队列满时由调用线程执行，保证消息不丢
@@ -63,6 +66,24 @@ public class ThreadPoolConfig {
                 new LinkedBlockingQueue<>(cacheRebuildQueueCapacity),
                 new ThreadFactoryBuilder().setNameFormat("cache-rebuild-%d").build(),
                 new ThreadPoolExecutor.DiscardPolicy()
+        );
+    }
+
+    /**
+     * WebSocket ACK 恢复影子写入线程。
+     *
+     * <p>单线程保证同一 pending 的 save/remove 顺序；队列满时拒绝影子更新，
+     * 不阻塞 WebSocket IO/ACK 快路径，消息仍可由数据库游标补拉恢复。</p>
+     */
+    @Bean(name = "wsAckPersistenceExecutor", destroyMethod = "shutdown")
+    public ThreadPoolExecutor wsAckPersistenceExecutor() {
+        return new ThreadPoolExecutor(
+                1,
+                1,
+                0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(wsAckStoreQueueCapacity),
+                new ThreadFactoryBuilder().setNameFormat("ws-ack-store-%d").build(),
+                new ThreadPoolExecutor.AbortPolicy()
         );
     }
 }

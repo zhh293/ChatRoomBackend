@@ -79,6 +79,12 @@ public interface RedisKeyConst {
     String WS_SYNC_CHANNEL = "ws:sync";
     String WS_PUSH_CHANNEL_PREFIX = "ws:push:";
 
+    /** WebSocket 待 ACK 恢复影子（Hash），key 后缀为 machineId，field=userId:msgId。 */
+    String WS_ACK_PENDING = "ws:ack:pending:";
+
+    /** WebSocket 待 ACK 到期索引（ZSet），key 后缀为 machineId，score=expireAt。 */
+    String WS_ACK_DEADLINE = "ws:ack:deadline:";
+
     /**
      * 历史消息翻阅缓存（ZSet，与热消息缓冲区结构一致）
      *

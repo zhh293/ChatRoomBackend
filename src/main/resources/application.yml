@@ -31,6 +31,10 @@ chat:
       max-delay-ms: 10000        # 单次重试最大延迟
       max-pending-per-user: 200  # 单用户最大待 ACK 消息数
       max-pending-total: 10000   # 单节点最大待 ACK 消息数
+      max-batch-size: 50         # 单次批量 ACK 最大条数
+      shadow-ttl-seconds: 86400  # Redis pending 恢复影子 TTL（1天）
+      recovery-batch-size: 10000 # 节点启动时最多恢复的 pending 数
+      recovery-delay-ms: 5000    # 恢复后等待连接重建的宽限时间
   group:
     write-fanout-threshold: 1000 # 写扩散阈值：成员数 < 此值用写扩散，否则读扩散
     max-member-count: 2000       # 群聊人数上限，建群和拉人时校验
@@ -58,6 +62,8 @@ thread-pool:
     core-size: 2
     max-size: 10
     queue-capacity: 200
+  ws-ack-store:
+    queue-capacity: 10000        # Redis ACK 影子异步操作队列；满时降级为客户端补拉
 
 # XXL-Job 配置
 xxl:

@@ -13,6 +13,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -87,7 +88,8 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         }
         try {
             JsonNode root = objectMapper.readTree(payload);
-            if ("MESSAGE_ACK".equals(root.path("type").asText())) {
+            String type = root.path("type").asText();
+            if ("MESSAGE_ACK".equals(type)) {
                 Long userId = (Long) session.getAttributes().get("userId");
                 long msgId = root.path("msgId").asLong(0L);
                 long sessionId = root.path("sessionId").asLong(0L);
@@ -96,6 +98,22 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
                     return;
                 }
                 ackManager.acknowledge(userId, msgId, sessionId);
+                return;
+            }
+            if ("MESSAGE_ACK_BATCH".equals(type)) {
+                Long userId = (Long) session.getAttributes().get("userId");
+                JsonNode items = root.path("items");
+                if (userId == null || !items.isArray()) {
+                    log.warn("[WS] 非法 MESSAGE_ACK_BATCH, userId={}, payload={}", userId, payload);
+                    return;
+                }
+                List<WebSocketAckManager.AckItem> ackItems = new ArrayList<>();
+                for (JsonNode item : items) {
+                    ackItems.add(new WebSocketAckManager.AckItem(
+                            item.path("msgId").asLong(0L),
+                            item.path("sessionId").asLong(0L)));
+                }
+                ackManager.acknowledgeBatch(userId, ackItems);
                 return;
             }
         } catch (Exception e) {

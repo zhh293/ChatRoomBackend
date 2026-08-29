@@ -1,0 +1,860 @@
+1. 业务背景：为什么“消息发出去了”不等于“消息送到了”
+本文讨论的场景来自一个实时消息平台：用户在线时通过长连接实时收消息，用户离线时要做离线补偿，关键消息要求尽可能做到用户视角上的“不丢、不重、可追踪”。
+
+核心要求如下：
+
+• 在线用户规模：千万级
+• 网关集群下行峰值：百万级消息/秒
+• 关键消息必须有应用层 ACK
+• 用户离线后消息不能丢，重新上线后需要补偿
+• 网关支持水平扩容、滚动发布和节点故障恢复
+
+很多团队初看会觉得：TCP 已经可靠了，为什么还要 ACK？
+
+原因很直接，TCP 只保证字节从一端内核发到另一端内核，不保证：
+
+• 客户端应用已经读到消息
+• 客户端业务线程已经处理成功
+• 客户端没有在收到后立刻崩溃
+• 服务端在发布重启前已经持久化投递状态
+所以，“传输层可靠”不等于“应用层可确认”，而可靠投递体系的本质，就是把这部分不确定性工程化。
+
+2. 真实案例：一个高并发 IM 推送系统是怎么被 ACK 风暴打疼的
+我们用一个典型场景来贯穿全文。
+
+某社交系统包含单聊、群聊、系统通知三类消息。最初方案很直接：
+
+• 业务服务写消息到 Kafka
+• 网关消费 Kafka 后直接向用户连接写出
+• 客户端收到后回 ACK
+• 服务端在内存里维护待 ACK 表
+这套方案在中小规模下可用，但在一次版本发布后暴露出三个问题：
+
+1. 客户端重连潮触发大量离线补发，ACK 流量瞬时放大。
+2. 固定间隔重试导致消息再次堆积，形成重试雪崩。
+3. 网关节点重启后，内存里的待 ACK 状态丢失，产生重复投递和对账困难。
+当时真正的问题不是“有没有 ACK”，而是 ACK 整体链路没有被当成一个独立子系统来设计。
+
+3. 先定边界：可靠投递到底要解决什么，不解决什么
+在开始设计前，先把目标说清楚很重要。
+
+这套方案解决的是：
+
+• 服务端能够知道一条消息是否被客户端应用层确认
+• 客户端未确认时，服务端能有限次重试
+• 用户离线或节点异常时，消息可补偿
+• 整个过程可追踪、可审计、可告警
+这套方案不承诺：
+
+• 分布式全局严格一次
+• 任意网络分区下绝对不重
+• 业务侧完全不需要幂等
+换句话说，生产里更现实的目标是：
+
+• 服务端“至少一次”投递
+• 客户端与业务侧“幂等消费”
+• 用户视角“尽量不丢、不重、可恢复”
+如果一开始就把目标写成“全链路 exactly-once”，系统往往会在复杂度上先失控。
+
+4. 整体架构：把投递、确认、补偿、路由彻底拆开
+
+Long Connection
+
+
+
+Long Connection
+
+
+
+Long Connection
+
+
+业务服务
+Kafkapush-topic
+Netty Gateway-1
+Netty Gateway-2
+Netty Gateway-N
+Redis ClusterSession Route / Dedup / Pending Meta
+Offline StoreRedis Stream / DB
+Kafkaack-event / retry-topic / dead-letter
+客户端
+4.1 组件职责
+组件
+职责
+Netty Gateway	
+长连接维护、协议编解码、消息下发、ACK 接收
+Redis	
+会话路由、幂等去重、待 ACK 元数据、短周期状态续期
+Kafka push-topic	
+业务下行命令/消息总线
+Kafka retry-topic	
+延迟重试或异步重投递链路
+Kafka ack-event	
+ACK 事件审计、对账、异步状态更新
+Offline Store	
+用户离线时的消息持久化与补偿
+Dead Letter Queue	
+超过最大重试次数的消息兜底
+4.2 为什么要这么拆
+这里最关键的三个设计原则是：
+
+1. 网关只做连接与轻逻辑，不做重业务计算。
+2. ACK 处理和消息投递分开，避免互相阻塞。
+3. 待确认状态既要有本地快路径，也要有可恢复的外部元数据。
+很多系统的问题，就出在把“投递成功”“ACK 成功”“业务消费成功”混成了一个状态。
+
+5. 技术原理：ACK、重试、补偿背后的底层机制
+5.1 为什么 ACK 必须是应用层协议
+在长连接系统里，最容易误判的一点是：writeAndFlush 成功只是消息进入了网卡发送路径，不表示客户端业务处理完成。
+
+所以应用层 ACK 至少要回答三个问题：
+
+• 哪条消息被确认了
+• 谁确认的
+• 确认的是“收到”还是“处理完成”
+通常建议 ACK 至少包含：
+
+• messageId
+• conversationId 或 bizKey
+• clientSeq
+• ackType
+• ackTime
+如果你的业务区分“已送达”和“已读”，那实际上是两个不同层级的确认，不能混用一个字段草草表示。
+
+5.2 为什么重试不能在原地阻塞等待
+很多人第一版会这样写：
+
+• 写出消息
+• sleep 3 秒
+• 没收到 ACK 就重发
+这在单机 Demo 里能跑，在生产里一定会出问题：
+
+• 阻塞 EventLoop 或业务线程
+• 大量待确认消息占住线程和内存
+• 网络抖动时集中超时，放大重试洪峰
+更合理的设计是：
+
+• 首发走实时链路
+• 超时检测走独立调度器或时间轮
+• 重试重新进入异步投递通道
+这样 ACK、超时、重投递三个动作可以解耦。
+
+5.3 为什么离线补偿不能只靠 Redis List
+Redis List 可以做短期离线缓存，但不能把它当成唯一长期真相：
+
+• 用户长期离线时，List 长度可能很大
+• 删除中间元素成本高
+• 补偿过程中断线，消息状态难以精细跟踪
+更稳妥的方案通常是分层：
+
+• 短期离线：Redis Stream 或 List
+• 中长期离线：数据库、对象存储或日志存储
+• 实时在线待 ACK：本地内存 + Redis 元数据
+分层的目的不是“组件更多”，而是让不同生命周期的数据放在合适的介质上。
+
+6. 数据模型设计：状态机不清楚，可靠投递一定会失控
+6.1 消息状态机
+可靠投递必须显式设计状态机，而不是只用一个 sent=true/false。
+
+CREATED
+ROUTED
+SENT
+ACKED
+TIMEOUT
+RETRYING
+OFFLINE_BUFFERED
+RESEND_ON_LOGIN
+DEAD_LETTER
+建议至少包含这些状态：
+
+• CREATED：业务消息已生成
+• ROUTED：已找到目标网关或目标用户路由
+• SENT：已向客户端写出
+• ACKED：收到客户端 ACK
+• TIMEOUT：超时未确认
+• RETRYING：已进入重试
+• OFFLINE_BUFFERED：已写入离线存储
+• DEAD_LETTER：超过阈值，转人工或异步补救
+6.2 关键 ID 设计
+一个可靠投递系统里，至少要区分四类 ID：
+
+• messageId：平台消息唯一标识
+• requestId：单次下发请求唯一标识
+• userId：消息目标用户
+• sessionId：当前连接会话标识
+为什么要分开：
+
+• 同一条消息可能有多次下发尝试，所以 messageId 不等于 requestId
+• 用户重连后 sessionId 会变化，但消息语义不变
+• 对账时需要区分“消息是否重复”和“请求是否重试”
+6.3 Redis Key 设计
+session:{userId}                  -> hash(nodeId, channelId, sessionId, lastSeen, version)
+pending:{requestId}               -> hash(messageId, userId, status, retryCount, expireAt)
+dedup:ack:{userId}:{messageId}    -> string(1) + TTL
+offline:{userId}                  -> stream/list
+node:sessions:{nodeId}            -> set(sessionId)
+设计原则：
+
+• 路由与待 ACK 分开建模
+• 重试次数、过期时间明确落字段
+• ACK 去重做短 TTL，避免重复 ACK 打爆状态更新
+• 节点维度保留索引，便于故障清理与迁移
+7. 正常流程：一条消息从创建到 ACK 到底经历了什么
+7.1 在线投递主流程
+Client
+Redis
+Netty Gateway
+Kafka
+Business Service
+Client
+Redis
+Netty Gateway
+Kafka
+Business Service
+发送 push-topic(messageId, userId)
+网关消费消息
+查询 session:{userId}
+返回 nodeId/sessionId
+写入本地 pending 表
+下发消息(requestId)
+ACK(requestId, messageId)
+清理本地 pending
+更新 pending 状态/去重标记
+发送 ack-event
+7.2 用户离线补偿流程
+Client
+Offline Store
+Netty Gateway
+Client
+Offline Store
+Netty Gateway
+写入 offline:{userId}
+用户重新登录
+拉取离线消息
+按顺序补发
+ACK
+标记已补偿/删除
+7.3 异常重试流程
+
+否
+
+
+
+是
+
+
+
+是
+
+
+
+否
+
+
+
+否
+
+
+
+是
+
+
+消息已发送
+ACK超时?
+完成
+用户还在线?
+进入 retry-topic
+写入 offline store
+指数退避后再次投递
+超过最大重试次数?
+进入 dead-letter
+8. 生产级代码实现：把可靠投递链路真正落下来
+下面给出一套接近真实工程的代码骨架。重点不是每个类都完整，而是核心职责、接口边界、命名和状态流转要闭环。
+
+8.1 推荐包结构
+com.example.gateway
+├── bootstrap
+├── protocol
+│   ├── codec
+│   ├── model
+│   └── handler
+├── session
+├── delivery
+│   ├── pending
+│   ├── retry
+│   ├── offline
+│   └── consumer
+├── store
+├── metrics
+└── config
+8.2 协议模型
+package com.example.gateway.protocol.model;
+
+import lombok.Builder;
+import lombok.Value;
+
+@Value
+@Builder
+public class PushFrame {
+    long requestId;
+    String messageId;
+    String userId;
+    byte type;
+    byte[] payload;
+    long serverTime;
+}
+package com.example.gateway.protocol.model;
+
+import lombok.Builder;
+import lombok.Value;
+
+@Value
+@Builder
+public class AckFrame {
+    long requestId;
+    String messageId;
+    String userId;
+    long clientTime;
+    byte ackType;
+}
+8.3 Netty Pipeline 设计
+package com.example.gateway.bootstrap;
+
+import com.example.gateway.protocol.codec.AckFrameDecoder;
+import com.example.gateway.protocol.codec.PushFrameEncoder;
+import com.example.gateway.protocol.handler.AckHandler;
+import com.example.gateway.protocol.handler.ConnectionHandler;
+import com.example.gateway.protocol.handler.HeartbeatHandler;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.WriteBufferWaterMark;
+import io.netty.channel.epoll.Epoll;
+import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.channel.epoll.EpollServerSocketChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.timeout.IdleStateHandler;
+
+import java.util.concurrent.TimeUnit;
+
+public class GatewayServer {
+
+    private final GatewayProperties properties;
+    private final ConnectionHandler connectionHandler;
+    private final HeartbeatHandler heartbeatHandler;
+    private final AckHandler ackHandler;
+
+    public GatewayServer(GatewayProperties properties,
+                         ConnectionHandler connectionHandler,
+                         HeartbeatHandler heartbeatHandler,
+                         AckHandler ackHandler) {
+        this.properties = properties;
+        this.connectionHandler = connectionHandler;
+        this.heartbeatHandler = heartbeatHandler;
+        this.ackHandler = ackHandler;
+    }
+
+    public void start() throws InterruptedException {
+        boolean epoll = properties.isPreferEpoll() && Epoll.isAvailable();
+        var boss = epoll ? new EpollEventLoopGroup(properties.getBossThreads())
+                : new NioEventLoopGroup(properties.getBossThreads());
+        var worker = epoll ? new EpollEventLoopGroup(properties.getWorkerThreads())
+                : new NioEventLoopGroup(properties.getWorkerThreads());
+
+        try {
+            ServerBootstrap bootstrap = new ServerBootstrap();
+            bootstrap.group(boss, worker)
+                    .channel(epoll ? EpollServerSocketChannel.class : NioServerSocketChannel.class)
+                    .option(ChannelOption.SO_BACKLOG, properties.getSoBacklog())
+                    .childOption(ChannelOption.TCP_NODELAY, true)
+                    .childOption(ChannelOption.SO_KEEPALIVE, true)
+                    .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,
+                            new WriteBufferWaterMark(
+                                    properties.getWriteBufferLowWaterMark(),
+                                    properties.getWriteBufferHighWaterMark()))
+                    .childHandler(new ChannelInitializer<>() {
+                        @Override
+                        protected void initChannel(SocketChannel ch) {
+                            ChannelPipeline pipeline = ch.pipeline();
+                            pipeline.addLast(new IdleStateHandler(
+                                    properties.getReaderIdleSeconds(), 0, 0, TimeUnit.SECONDS));
+                            pipeline.addLast(new AckFrameDecoder(properties.getMaxFrameLength()));
+                            pipeline.addLast(new PushFrameEncoder());
+                            pipeline.addLast(connectionHandler);
+                            pipeline.addLast(heartbeatHandler);
+                            pipeline.addLast(ackHandler);
+                        }
+                    });
+
+            bootstrap.bind(properties.getPort()).sync().channel().closeFuture().sync();
+        } finally {
+            boss.shutdownGracefully();
+            worker.shutdownGracefully();
+        }
+    }
+}
+这条 Pipeline 的重点是：
+
+• 连接生命周期处理和 ACK 处理分开
+• 读空闲检测前置，避免僵尸连接长期占资源
+• 写缓冲高低水位用于出站背压
+8.4 待 ACK 记录模型
+package com.example.gateway.delivery.pending;
+
+import lombok.Builder;
+import lombok.Value;
+
+@Value
+@Builder(toBuilder = true)
+public class PendingMessage {
+    String messageId;
+    long requestId;
+    String userId;
+    String sessionId;
+    int retryCount;
+    long expireAt;
+    DeliveryStatus status;
+}
+package com.example.gateway.delivery.pending;
+
+public enum DeliveryStatus {
+    CREATED,
+    SENT,
+    ACKED,
+    TIMEOUT,
+    OFFLINE_BUFFERED,
+    DEAD_LETTER
+}
+8.5 PushService：下发与登记
+package com.example.gateway.delivery;
+
+import com.example.gateway.delivery.offline.OfflineMessageStore;
+import com.example.gateway.delivery.pending.PendingAckManager;
+import com.example.gateway.protocol.model.PushFrame;
+import com.example.gateway.session.LocalSessionRegistry;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFutureListener;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@RequiredArgsConstructor
+public class PushService {
+
+    private final LocalSessionRegistry localSessionRegistry;
+    private final PendingAckManager pendingAckManager;
+    private final OfflineMessageStore offlineMessageStore;
+
+    public DeliveryResult push(DeliveryCommand command) {
+        Channel channel = localSessionRegistry.getChannel(command.userId()).orElse(null);
+        if (channel == null || !channel.isActive()) {
+            offlineMessageStore.save(command);
+            return DeliveryResult.offline(command.messageId());
+        }
+
+        PushFrame frame = PushFrame.builder()
+                .requestId(command.requestId())
+                .messageId(command.messageId())
+                .userId(command.userId())
+                .type(command.type())
+                .payload(command.payload())
+                .serverTime(System.currentTimeMillis())
+                .build();
+
+        channel.writeAndFlush(frame).addListener((ChannelFutureListener) future -> {
+            if (future.isSuccess()) {
+                pendingAckManager.add(command, channel);
+            } else {
+                log.warn("push failed, fallback to offline, messageId={}, userId={}",
+                        command.messageId(), command.userId(), future.cause());
+                offlineMessageStore.save(command);
+            }
+        });
+
+        return DeliveryResult.sent(command.messageId(), command.requestId());
+    }
+}
+关键点：
+
+• 先写 Channel，再登记本地 pending，避免“没发出去却先进入待 ACK”
+• 写失败直接转离线链路，不在当前线程死磕重试
+8.6 AckHandler：ACK 快路径处理
+package com.example.gateway.protocol.handler;
+
+import com.example.gateway.delivery.pending.PendingAckManager;
+import com.example.gateway.metrics.GatewayMetrics;
+import com.example.gateway.protocol.model.AckFrame;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.SimpleChannelInboundHandler;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@RequiredArgsConstructor
+public class AckHandler extends SimpleChannelInboundHandler<AckFrame> {
+
+    private final PendingAckManager pendingAckManager;
+    private final GatewayMetrics gatewayMetrics;
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, AckFrame ack) {
+        boolean confirmed = pendingAckManager.confirm(ack);
+        if (confirmed) {
+            gatewayMetrics.recordAckSuccess();
+            return;
+        }
+        gatewayMetrics.recordDuplicateOrLateAck();
+        log.debug("ignore duplicate or late ack, requestId={}, messageId={}",
+                ack.getRequestId(), ack.getMessageId());
+    }
+}
+这一步要追求的是“快”：
+
+• 优先走内存命中
+• 重复 ACK 快速丢弃
+• 审计、日志、异步状态更新后置
+8.7 PendingAckManager：超时、重试、去重
+package com.example.gateway.delivery.pending;
+
+import com.example.gateway.delivery.DeliveryCommand;
+import com.example.gateway.delivery.offline.OfflineMessageStore;
+import com.example.gateway.delivery.retry.RetryProducer;
+import com.example.gateway.protocol.model.AckFrame;
+import io.netty.channel.Channel;
+import lombok.RequiredArgsConstructor;
+
+import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+@RequiredArgsConstructor
+public class PendingAckManager {
+
+    private final Map<Long, PendingContext> pendingMap = new ConcurrentHashMap<>();
+    private final OfflineMessageStore offlineMessageStore;
+    private final RetryProducer retryProducer;
+    private final int maxRetry;
+    private final long ackTimeoutMillis;
+    private final ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "ack-timeout-scanner"));
+
+    public void start() {
+        scheduler.scheduleAtFixedRate(this::scanTimeout, 1, 1, TimeUnit.SECONDS);
+    }
+
+    public void add(DeliveryCommand command, Channel channel) {
+        PendingMessage pending = PendingMessage.builder()
+                .messageId(command.messageId())
+                .requestId(command.requestId())
+                .userId(command.userId())
+                .sessionId(command.sessionId())
+                .retryCount(command.retryCount())
+                .expireAt(System.currentTimeMillis() + ackTimeoutMillis)
+                .status(DeliveryStatus.SENT)
+                .build();
+        pendingMap.put(command.requestId(), new PendingContext(pending, channel, command));
+    }
+
+    public boolean confirm(AckFrame ack) {
+        PendingContext removed = pendingMap.remove(ack.getRequestId());
+        return removed != null;
+    }
+
+    private void scanTimeout() {
+        long now = System.currentTimeMillis();
+        pendingMap.forEach((requestId, context) -> {
+            if (context.pending().getExpireAt() > now) {
+                return;
+            }
+            if (!pendingMap.remove(requestId, context)) {
+                return;
+            }
+            DeliveryCommand command = context.command();
+            if (command.retryCount() >= maxRetry) {
+                offlineMessageStore.deadLetter(command, "ack timeout over max retry");
+                return;
+            }
+            if (context.channel() == null || !context.channel().isActive()) {
+                offlineMessageStore.save(command.nextRetry());
+                return;
+            }
+            retryProducer.send(command.nextRetry(), nextDelay(command.retryCount() + 1));
+        });
+    }
+
+    private Duration nextDelay(int retryCount) {
+        long base = 1000L;
+        long max = 30000L;
+        long delay = Math.min(base * (1L << Math.min(retryCount, 10)), max);
+        long jitter = java.util.concurrent.ThreadLocalRandom.current().nextLong(200, 800);
+        return Duration.ofMillis(delay + jitter);
+    }
+}
+这里体现的是几个生产经验：
+
+• ACK 超时扫描不能阻塞 IO 线程
+• 超时后不要立刻原地重发，而要进入统一重试链路
+• 连接已失效时，应直接转离线或死信，而不是盲目继续写
+8.8 离线补偿
+package com.example.gateway.delivery.offline;
+
+import com.example.gateway.delivery.DeliveryCommand;
+import com.example.gateway.delivery.PushService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.List;
+
+@Slf4j
+@RequiredArgsConstructor
+public class OfflineCompensator {
+
+    private final OfflineMessageStore offlineMessageStore;
+    private final PushService pushService;
+
+    public void onUserLogin(String userId) {
+        List<DeliveryCommand> commands = offlineMessageStore.fetch(userId, 100);
+        for (DeliveryCommand command : commands) {
+            DeliveryResult result = pushService.push(command);
+            if (result.isSent()) {
+                offlineMessageStore.markInflight(userId, command.messageId());
+            } else {
+                break;
+            }
+        }
+    }
+}
+离线补偿最容易踩的坑有两个：
+
+• 一次性全量补发，导致用户刚上线就被海量消息打爆
+• 补偿消息和实时消息混发，造成顺序错乱
+更稳的方式是：
+
+• 分批补偿
+• 单用户串行补偿
+• 补偿期间对实时消息做队列合并或优先级控制
+9. ACK 风暴怎么治理：很多系统死就死在这里
+所谓 ACK 风暴，本质是“平台主动下发很多消息，然后客户端在短时间内集中回 ACK”，造成：
+
+• 网关入站流量激增
+• pending 状态大量并发更新
+• Redis/Kafka ACK 审计链路被打满
+典型触发场景：
+
+• 大规模离线补偿
+• 群聊热点消息
+• 客户端重连后批量补 ACK
+• 节点恢复后积压消息集中投递
+治理思路通常不是单点优化，而是组合拳：
+
+9.1 ACK 去重与轻量化
+• ACK 报文尽量短，只回必要字段
+• 对重复 ACK 做本地快速丢弃
+• ACK 成功后异步写审计链路，不要同步打远程存储
+9.2 ACK 合并
+如果客户端协议允许，可以按窗口合并：
+
+• ACK 单条消息
+• ACK 一段连续序号
+• ACK 截止某个最大连续消息号
+合并 ACK 会显著降低高频会话的回包量，但前提是协议和状态机要一起设计。
+
+9.3 离线补偿节流
+不要让一个刚登录用户瞬间补全全部历史消息，建议：
+
+• 单用户补偿批次上限
+• 节点维度总补偿并发上限
+• 补偿和实时投递分优先级
+9.4 ACK 处理本地化
+ACK 清理首先命中本地 pendingMap，只有需要审计和对账时才异步写 Kafka/Redis。否则所有 ACK 都走远程状态更新，系统会被自己拖垮。
+
+10. 高并发与可扩展设计：网关为什么不能只是“多开几台”
+10.1 连接层与投递层分离
+如果网关同时承担：
+
+• 连接维护
+• 业务解码
+• 消息投递
+• ACK 处理
+• 重试调度
+那么一旦某个环节变慢，整台节点就会被连带拖垮。更合理的是逻辑分层、资源隔离：
+
+• EventLoop 负责 IO
+• 异步线程池负责序列化/轻计算
+• 重试扫描单独调度
+• Kafka 消费线程与网络线程隔离
+10.2 单用户串行，整体并行
+可靠投递最怕顺序错乱。一个很实用的原则是：
+
+• 单用户消息串行
+• 多用户消息并行
+常见实现方式：
+
+• Kafka 按 userId 分区
+• 网关内部按 userId 做有界队列
+• 离线补偿同样按用户维度串行
+10.3 资源隔离
+推荐至少做三层资源隔离：
+
+1. 实时消息与离线补偿隔离
+2. 高优先级消息与普通消息隔离
+3. 大客户租户与普通租户隔离
+否则一个大群聊或一个大租户就可能拖慢整个平台。
+
+10.4 发布与扩缩容
+长连接服务发布时，不能直接粗暴重启。更稳的步骤是：
+
+1. 从负载均衡摘流
+2. 停止消费新的 push-topic 分区
+3. 等待待 ACK 集合自然收敛
+4. 将剩余未确认消息转移到重试或离线链路
+5. 再关闭连接
+这一步做不好，发布本身就会制造一场离线补偿洪峰。
+
+11. 一致性、幂等与故障恢复
+11.1 为什么客户端必须幂等
+只要服务端采用“至少一次”投递，客户端就必须支持幂等。最常见做法是：
+
+• 客户端保存最近处理过的 messageId
+• 重复消息直接忽略
+• 读写路径按 messageId 去重
+如果业务端没有幂等，服务端重试次数越多，事故越大。
+
+11.2 节点重启后如何恢复
+网关节点重启时，本地 pendingMap 会丢失，所以需要明确恢复策略：
+
+• 本地 pending 只做快路径
+• Redis 或 Kafka 里保留最小必要的 pending 元数据
+• 节点重启后，将未完成消息重新路由到 retry-topic
+不要指望单机内存能作为可靠投递的最终真相。
+
+11.3 Kafka 积压时怎么办
+Kafka 积压本身不可怕，可怕的是积压恢复时的瞬时洪峰。建议：
+
+• 消费恢复时做限速
+• 优先恢复高优先级消息
+• 离线补偿和实时投递不要共用一套无限制消费者
+11.4 死信怎么处理
+死信不是“丢弃”，而是进入下一阶段治理：
+
+• 人工排查
+• 自动补发
+• 转短信/Push 等旁路通知
+• 业务降级
+死信队列真正的价值是把异常显式化，而不是把异常藏起来。
+
+12. 可观测性：没有指标，你根本不知道是 ACK 风暴还是重试雪崩
+12.1 必备指标
+• 当前在线连接数
+• 每秒下发消息数
+• 每秒 ACK 数
+• ACK 平均耗时与 P99
+• pendingMap 当前大小
+• 超时重试次数
+• 离线补偿速率
+• 死信累计数
+• Kafka topic 积压量
+12.2 必备日志字段
+至少统一这些字段：
+
+• messageId
+• requestId
+• userId
+• sessionId
+• nodeId
+• retryCount
+• deliveryStatus
+12.3 告警建议
+• ACK 超时率持续上升
+• 某节点 pendingMap 激增
+• 离线补偿队列快速堆积
+• 死信队列异常增长
+• 某租户 ACK QPS 异常放大
+没有这几类告警，线上故障通常只能靠“用户说没收到消息”才发现。
+
+13. 配置、压测与生产运维建议
+13.1 建议配置化的参数
+下面这些参数都不应该硬编码：
+
+• ACK 超时时间
+• 最大重试次数
+• 重试退避策略
+• 离线补偿批大小
+• 单用户补偿并发
+• Kafka topic 名称
+• 写缓冲高低水位
+13.2 压测重点
+这类系统压测不能只测“每秒发多少消息”，还要单独测：
+
+• ACK 洪峰
+• 离线补偿恢复
+• 节点摘流与重启
+• Kafka 积压回放
+• Redis 路由热点
+13.3 一组实用的故障演练题
+建议上线前至少做这几类演练：
+
+1. 某网关节点瞬时下线
+2. Kafka 某分区积压 10 分钟后恢复
+3. Redis 短暂抖动导致路由查询超时
+4. 客户端 ACK 延迟突然升高
+5. 离线用户大规模回流
+真正的生产级可靠性，不是在文档里写“支持重试”，而是在这些故障场景下系统还能稳住。
+
+14. 常见误区
+14.1 误区一：有 TCP 就不需要 ACK
+这是最常见也最危险的误解。TCP 可靠的是字节流，不是业务确认。
+
+14.2 误区二：所有消息都走同一套高可靠链路
+不是所有消息都值得同样的成本。更合理的是分级：
+
+• 核心消息：ACK + 重试 + 死信
+• 普通消息：有限重试
+• 弱通知：允许降级或丢弃
+14.3 误区三：离线补偿越快越好
+补偿太快会直接引发新的 ACK 风暴和实时链路抖动。
+
+14.4 误区四：pending 状态只放内存就够了
+一旦节点重启或进程崩溃，所有状态都会消失，排障和恢复都会变得困难。
+
+
+15. 方案边界与演进方向
+这套方案适合：
+
+• IM 实时消息
+• 长连接通知平台
+• 设备控制指令回执
+• 需要 ACK 与补偿的网关投递场景
+它的边界也很明确：
+
+• 如果业务天然允许大面积丢消息，不需要这么重
+• 如果协议已经是 MQTT 且 Broker 能满足需求，应先评估 Broker 能力
+• 如果重点是超低延迟撮合，而不是投递可靠性，架构权衡会不同
+进一步的演进方向可以包括：
+
+• ACK 合并协议
+• 多级优先级队列
+• 边缘节点本地补偿
+• 基于租户的动态限流和隔离
+• 用时间轮或分层延迟队列替代简单扫描器
+16. 总结
+长连接网关的可靠投递，从来不是“加一个 ACK 字段”这么简单。真正要成立的，是一整套完整链路：
+
+• 在线投递有 ACK
+• 超时后有重试
+• 离线时有补偿
+• 节点异常时可恢复
+• 洪峰来临时有节流和背压
+• 全链路可观测、可审计、可告警
+如果把这件事压缩成一句话，那就是：
+
+可靠投递的本质，不是保证消息永远只发一次，而是让系统在网络不确定、节点会故障、客户端会重连的前提下，仍然能把“确认、重试、补偿、恢复”这四件事做成一个闭环。
+
+
+
